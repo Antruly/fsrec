@@ -1236,6 +1236,21 @@ void Scanner::raw_scan_all_worker(std::shared_ptr<ScanTask> meta) {
         emit(true, t);
     };
 
+    // Block while a pause is requested; honors stop (which clears pause). Used
+    // during the locate/validate phases that run before the per-volume workers
+    // exist, so pausing a whole-disk scan takes effect even in phase 1/2.
+    auto check_pause = [&]() {
+        if (!meta->pause_requested.load() || meta->stop_requested.load()) return;
+        { std::lock_guard<std::mutex> lock(meta->mtx); meta->status = "paused"; }
+        emit(true, "paused");
+        while (meta->pause_requested.load() && !meta->stop_requested.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (!meta->stop_requested.load()) {
+            { std::lock_guard<std::mutex> lock(meta->mtx); meta->status = "running"; }
+            emit(true, "resumed");
+        }
+    };
+
     const int disk = meta->disk_number;
     DiskReader reader;
     std::string err;
@@ -1267,6 +1282,7 @@ void Scanner::raw_scan_all_worker(std::shared_ptr<ScanTask> meta) {
     std::vector<RawMftCandidate> cands = scan_mft_candidates(
         reader, full, &meta->stop_requested,
         [&](uint64_t done) {
+            check_pause();
             if (meta->stop_requested.load()) return;
             int pct = (full == 0) ? 5 : 1 + static_cast<int>((8 * done) / full);
             if (pct > 9) pct = 9;
@@ -1297,6 +1313,8 @@ void Scanner::raw_scan_all_worker(std::shared_ptr<ScanTask> meta) {
     std::vector<uint8_t> rec0(1024);
 
     for (const auto& cand : cands) {
+        check_pause();
+        if (meta->stop_requested.load()) break;
         FileNode n0;
         size_t rg = 0;
         std::fill(rec0.begin(), rec0.end(), 0);
