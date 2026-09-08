@@ -1,0 +1,32 @@
+# ---- 构建产物 ----
+/build/
+/release/
+
+# ---- 运行时数据（扫描结果缓存，含用户磁盘数据，绝不上传）----
+/data/
+
+# ---- 第三方可再分发二进制（VC++ 运行库安装包）----
+/vc++/
+
+# ---- 前端：仅保留 dist/，其余为废弃的 Vue 工程残留 ----
+/frontend/*
+!/frontend/dist/
+
+# ---- 设计源文件 ----
+*.psd
+
+# ---- 独立查看器（开发期遗留，非产品组成部分）----
+/viewer.html
+
+# ---- IDE / 工具 ----
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# ---- CMake 生成文件 ----
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.ninja

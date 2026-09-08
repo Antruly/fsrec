@@ -1,0 +1,1194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>fsrec · NTFS 数据恢复</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f3f5f9;
+    --card: #ffffff;
+    --border: #e5e8ef;
+    --text: #1c2230;
+    --muted: #697386;
+    --primary: #2f6bff;
+    --primary-weak: #eef3ff;
+    --amber: #d97706;
+    --amber-bg: #fff6e8;
+    --green: #16a34a;
+    --green-weak: #eafaf0;
+    --red: #dc2626;
+    --red-bg: #fdecec;
+    --radius: 14px;
+    --shadow: 0 1px 2px rgba(16,24,40,.05), 0 2px 8px rgba(16,24,40,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1320;
+      --card: #171f30;
+      --border: #26304a;
+      --text: #e7ebf5;
+      --muted: #8b94ad;
+      --primary: #5b85ff;
+      --primary-weak: #1c2745;
+      --amber: #f0a23c;
+      --amber-bg: #2a2213;
+      --green: #3fd278;
+      --green-weak: #12251b;
+      --red: #f0706a;
+      --red-bg: #2a1b1e;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 2px 10px rgba(0,0,0,.35);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI", "Microsoft YaHei", -apple-system, sans-serif;
+    background: var(--bg); color: var(--text);
+    font-size: 14px; line-height: 1.5;
+  }
+
+  /* ---- top bar ---- */
+  .topbar {
+    background: linear-gradient(135deg, #1a2747 0%, #27406e 60%, #2f6bff 100%);
+    color: #fff; padding: 22px 0 20px;
+    border-bottom: 1px solid rgba(255,255,255,.06);
+  }
+  .topbar-inner { max-width: 1180px; margin: 0 auto; padding: 0 20px; display: flex; align-items: center; gap: 14px; }
+  .logo { width: 40px; height: 40px; border-radius: 10px; background: rgba(255,255,255,.14); display: flex; align-items: center; justify-content: center; font-size: 22px; flex: 0 0 auto; }
+  .topbar h1 { margin: 0; font-size: 19px; font-weight: 600; letter-spacing: .3px; }
+  .topbar .sub { margin: 2px 0 0; font-size: 12.5px; color: rgba(255,255,255,.72); }
+
+  .container { max-width: 1180px; margin: 0 auto; padding: 20px; }
+
+  /* ---- safety banner ---- */
+  .banner {
+    display: flex; gap: 10px; align-items: flex-start;
+    background: var(--amber-bg); border: 1px solid var(--amber);
+    color: var(--text); border-radius: var(--radius); padding: 12px 16px; margin-bottom: 16px;
+  }
+  .banner .b-ico { font-size: 18px; line-height: 1.3; }
+  .banner b { color: var(--amber); }
+  .banner .b-txt { font-size: 13px; }
+
+  /* ---- card ---- */
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: var(--shadow); padding: 20px; margin-bottom: 16px;
+  }
+  .card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+  .step {
+    width: 26px; height: 26px; border-radius: 50%; flex: 0 0 auto;
+    background: var(--primary); color: #fff; font-weight: 700; font-size: 14px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .card-head h2 { margin: 0; font-size: 16px; font-weight: 600; }
+  .card-head .hint-inline { margin-left: auto; font-size: 12px; color: var(--muted); }
+
+  /* ---- disk cards ---- */
+  .disk-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+  .disk-card {
+    text-align: left; border: 1.5px solid var(--border); background: var(--card);
+    border-radius: 12px; padding: 14px 16px; cursor: pointer; color: var(--text);
+    transition: border-color .15s, box-shadow .15s, transform .1s;
+    font-family: inherit; display: block;
+  }
+  .disk-card:hover { border-color: var(--primary); }
+  .disk-card.selected { border-color: var(--primary); background: var(--primary-weak); box-shadow: 0 0 0 3px rgba(47,107,255,.14); }
+  .disk-card.disabled { opacity: .5; cursor: not-allowed; }
+  .disk-num { font-size: 16px; font-weight: 700; }
+  .disk-model { color: var(--muted); font-size: 12.5px; margin: 2px 0 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .disk-size { font-size: 13px; }
+  .disk-badge { display: inline-block; margin-top: 8px; font-size: 11.5px; padding: 2px 8px; border-radius: 20px; }
+  .disk-badge.sys { background: var(--red-bg); color: var(--red); }
+  .disk-badge.ok { background: var(--green-weak); color: var(--green); }
+
+  /* ---- controls ---- */
+  .form-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  .field { display: flex; align-items: center; gap: 8px; flex: 1 1 340px; }
+  .field label { color: var(--muted); font-size: 13px; white-space: nowrap; }
+  input[type=text] {
+    flex: 1; min-width: 0; padding: 10px 12px; font-size: 14px;
+    border: 1px solid var(--border); border-radius: 10px; background: var(--card); color: var(--text);
+  }
+  input[type=text]:focus { outline: none; border-color: var(--primary); }
+
+  .btn {
+    display: inline-flex; align-items: center; gap: 6px; padding: 10px 18px; font-size: 14px;
+    font-weight: 600; border-radius: 10px; border: 1px solid transparent; cursor: pointer;
+    font-family: inherit; transition: filter .12s, background .12s; white-space: nowrap;
+  }
+  .btn:hover:not(:disabled) { filter: brightness(1.06); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .btn.primary { background: var(--primary); color: #fff; }
+  .btn.amber { background: var(--amber); color: #fff; }
+  .btn.green { background: var(--green); color: #fff; }
+  .btn.ghost { background: transparent; color: var(--text); border-color: var(--border); }
+  .btn.ghost:hover:not(:disabled) { background: var(--primary-weak); }
+
+  label.confirm { font-size: 13px; display: flex; align-items: flex-start; gap: 8px; margin-top: 14px; cursor: pointer; }
+  label.confirm input { margin-top: 2px; }
+  label.confirm b { color: var(--red); }
+
+  /* ---- progress ---- */
+  .progress-block { margin-top: 16px; }
+  .progress { height: 8px; background: var(--border); border-radius: 20px; overflow: hidden; }
+  .progress > div { height: 100%; background: linear-gradient(90deg, var(--amber), #f59e0b); width: 0; transition: width .3s; border-radius: 20px; }
+  .progress.green > div { background: linear-gradient(90deg, var(--green), #4ade80); }
+  .prog-label { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--muted); margin-top: 6px; }
+
+  /* ---- stats grid ---- */
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px; }
+  .stat {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px;
+  }
+  .stat .k { font-size: 12.5px; color: var(--muted); }
+  .stat .v { font-size: 20px; font-weight: 700; margin-top: 2px; }
+  .stat .v.danger { color: var(--red); }
+  .stat .v.accent { color: var(--primary); }
+
+  /* ---- saved scans ---- */
+  .saved-list { display: flex; flex-direction: column; gap: 8px; }
+  .saved-item { display: flex; align-items: center; gap: 14px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; }
+  .saved-item .info { font-size: 13px; flex: 1; min-width: 0; }
+  .saved-item .info b { font-weight: 700; }
+
+  /* ---- tree ---- */
+  .tree-toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+  .tree-toolbar input { flex: 1 1 220px; }
+  #tree { font-size: 13px; max-height: 62vh; overflow: auto; border: 1px solid var(--border); border-radius: 12px; padding: 8px 10px; background: var(--card); }
+  .node-wrap { display: block; }
+  .node { display: flex; align-items: center; gap: 8px; padding: 3px 6px; border-radius: 7px; min-width: 0; }
+  .node:hover { background: var(--primary-weak); }
+  .node input[type=checkbox] { flex: 0 0 auto; cursor: pointer; }
+  .node .arrow { width: 16px; text-align: center; color: var(--muted); cursor: pointer; user-select: none; flex: 0 0 auto; }
+  .node .arrow.leaf { visibility: hidden; }
+  .node .icon { font-size: 15px; flex: 0 0 auto; }
+  .node .name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: default; }
+  .node.deleted .name { color: var(--red); }
+  .node .meta { color: var(--muted); font-size: 12px; white-space: nowrap; flex: 0 0 auto; }
+  .tag { font-size: 11px; padding: 1px 7px; border-radius: 20px; flex: 0 0 auto; }
+  .tag.del { background: var(--red-bg); color: var(--red); }
+  .tag.norec { background: var(--bg); color: var(--muted); border: 1px solid var(--border); }
+  .children { margin-left: 22px; border-left: 1px solid var(--border); padding-left: 10px; }
+  .empty { color: var(--muted); text-align: center; padding: 28px; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .hint { margin-top: 10px; color: var(--muted); font-size: 12.5px; }
+  .danger-note { color: var(--red); font-weight: 600; }
+
+  /* ---- recover controls + per-file progress ---- */
+  input[readonly] { cursor: pointer; background: var(--primary-weak); }
+  .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+  .curfile { margin-top: 10px; font-size: 12.5px; color: var(--muted); word-break: break-all; }
+  .curfile b { color: var(--text); }
+  .thin { height: 5px; background: var(--border); border-radius: 20px; overflow: hidden; margin-top: 6px; }
+  .thin > div { height: 100%; background: var(--primary); width: 0; transition: width .2s; }
+
+  /* ---- modal / directory picker ---- */
+  .modal { position: fixed; inset: 0; background: rgba(10,14,26,.55); display: flex; align-items: center; justify-content: center; z-index: 50; }
+  .modal-box { width: min(640px, 94vw); max-height: 84vh; display: flex; flex-direction: column; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: 0 12px 40px rgba(0,0,0,.3); overflow: hidden; }
+  .modal-head { display: flex; align-items: center; gap: 10px; padding: 14px 18px; border-bottom: 1px solid var(--border); font-weight: 600; }
+  .modal-x { margin-left: auto; background: transparent; border: none; color: var(--muted); font-size: 18px; cursor: pointer; }
+  .picker-drives { display: flex; gap: 8px; flex-wrap: wrap; padding: 12px 18px; border-bottom: 1px solid var(--border); }
+  .drive-chip { padding: 8px 14px; border-radius: 10px; border: 1px solid var(--border); cursor: pointer; font-size: 13px; }
+  .drive-chip.active { border-color: var(--primary); background: var(--primary-weak); }
+  .drive-chip.blocked { opacity: .45; cursor: not-allowed; text-decoration: line-through; }
+  .picker-path { padding: 10px 18px; font-size: 12.5px; color: var(--muted); word-break: break-all; }
+  .picker-list { flex: 1 1 auto; overflow: auto; padding: 6px 10px 14px; min-height: 180px; }
+  .picker-item { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 8px; cursor: pointer; }
+  .picker-item:hover { background: var(--primary-weak); }
+  .picker-item .icon { font-size: 15px; }
+  .picker-foot { display: flex; gap: 8px; align-items: center; padding: 12px 18px; border-top: 1px solid var(--border); flex-wrap: wrap; }
+  .picker-foot input { flex: 1 1 160px; min-width: 0; }
+
+  /* ---- brand / topbar actions ---- */
+  .ver { font-size: 12px; font-weight: 500; color: rgba(255,255,255,.85); background: rgba(255,255,255,.16); padding: 2px 8px; border-radius: 20px; margin-left: 8px; vertical-align: middle; }
+  .brand { flex: 1; min-width: 0; }
+  .topbar-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .conn { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: rgba(255,255,255,.85); background: rgba(255,255,255,.1); padding: 5px 10px; border-radius: 20px; }
+  .conn .dot { width: 8px; height: 8px; border-radius: 50%; background: #f0a23c; }
+  .conn.ok .dot { background: #3fd278; }
+  .conn.bad .dot { background: #f0706a; }
+  .topbtn { background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.2); color: #fff; padding: 6px 12px; border-radius: 10px; font-size: 13px; cursor: pointer; font-family: inherit; }
+  .topbtn:hover { background: rgba(255,255,255,.22); }
+
+  /* ---- step indicator ---- */
+  .steps { display: flex; align-items: center; margin: 0 0 16px; flex-wrap: wrap; }
+  .step-item { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+  .step-item .s-num { width: 24px; height: 24px; border-radius: 50%; background: var(--border); color: var(--muted); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 12px; flex: 0 0 auto; }
+  .step-item.active { color: var(--text); font-weight: 600; }
+  .step-item.active .s-num { background: var(--primary); color: #fff; }
+  .step-item.done .s-num { background: var(--green); color: #fff; }
+  .step-line { flex: 1 1 20px; height: 2px; background: var(--border); margin: 0 10px; min-width: 16px; }
+  .step-item.done + .step-line { background: var(--green); }
+
+  /* ---- footer ---- */
+  .footer { border-top: 1px solid var(--border); margin-top: 8px; padding: 16px 20px 24px; }
+  .footer-inner { max-width: 1180px; margin: 0 auto; display: flex; gap: 8px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
+  .footer a { color: var(--primary); cursor: pointer; text-decoration: none; }
+  .footer a:hover { text-decoration: underline; }
+  .footer-sep { opacity: .5; }
+
+  /* ---- help modal ---- */
+  .help-body { overflow: auto; padding: 16px 20px 20px; font-size: 13.5px; line-height: 1.65; }
+  .help-body h3 { margin: 16px 0 6px; font-size: 14px; }
+  .help-body h3:first-child { margin-top: 0; }
+  .help-body ol, .help-body ul { margin: 6px 0; padding-left: 20px; }
+  .help-body li { margin: 4px 0; }
+  .help-body code { background: var(--bg); border: 1px solid var(--border); padding: 1px 6px; border-radius: 6px; font-size: 12.5px; }
+  .help-body .warn { color: var(--red); }
+
+  @media (max-width: 640px) {
+    .container { padding: 12px; }
+    .card { padding: 16px; }
+    .topbar-inner { padding: 0 14px; }
+  }
+</style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="logo">🛠️</div>
+      <div class="brand">
+        <h1>fsrec <span class="ver">v1.0.0</span></h1>
+        <p class="sub">NTFS 数据恢复 · 误格式化 / 覆盖的硬盘 · 只读扫描定位 → 手动确认恢复</p>
+      </div>
+      <div class="topbar-right">
+        <span class="conn" id="connStatus"><span class="dot"></span><span id="connText">连接中…</span></span>
+        <button id="helpBtn" class="topbtn">❓ 帮助</button>
+        <button id="aboutBtn" class="topbtn">ℹ️ 关于</button>
+        <button id="disclaimerBtn" class="topbtn">🛡️ 免责声明</button>
+      </div>
+    </div>
+  </header>
+
+  <div class="container">
+
+    <div class="banner">
+      <span class="b-ico">⚠️</span>
+      <div class="b-txt">
+        <b>安全须知：</b>扫描阶段只读，<b>绝不写入源盘</b>；恢复阶段需你在下方手动勾选文件、填写输出目录并再次确认后才开始。<b>严禁选择磁盘 0 / 系统盘</b>，恢复输出目录必须位于<b>另一块磁盘</b>。
+      </div>
+    </div>
+
+    <!-- 步骤指示 -->
+    <div class="steps" id="steps">
+      <div class="step-item active" data-step="1"><span class="s-num">1</span><span class="s-label">选择磁盘</span></div>
+      <div class="step-line"></div>
+      <div class="step-item" data-step="2"><span class="s-num">2</span><span class="s-label">扫描定位</span></div>
+      <div class="step-line"></div>
+      <div class="step-item" data-step="3"><span class="s-num">3</span><span class="s-label">勾选文件</span></div>
+      <div class="step-line"></div>
+      <div class="step-item" data-step="4"><span class="s-num">4</span><span class="s-label">恢复</span></div>
+    </div>
+
+    <!-- 已保存的扫描 -->
+    <div class="card" id="savedPanel" style="display:none">
+      <div class="card-head"><span class="step">📁</span><h2>已保存的扫描</h2><span class="hint-inline">无需重新扫描，直接加载</span></div>
+      <div class="saved-list" id="savedList"></div>
+    </div>
+
+    <!-- 1. 扫描 -->
+    <div class="card">
+      <div class="card-head"><span class="step">1</span><h2>选择物理磁盘并扫描</h2></div>
+      <div class="disk-grid" id="diskGrid"><div class="empty">正在加载物理磁盘…</div></div>
+      <label class="confirm">
+        <input type="checkbox" id="confirm">
+        <span>我已核对所选磁盘（<b>绝不选择磁盘 0 / 系统盘</b>），并明白本次为<b>只读扫描</b>，不会写入任何数据</span>
+      </label>
+      <div class="form-row" style="margin-top:14px">
+        <button id="scanBtn" class="btn amber" disabled>🔍 只读扫描定位</button>
+        <button id="scanPauseBtn" class="btn amber" disabled style="display:none">⏸ 暂停</button>
+        <button id="scanResumeBtn" class="btn green" disabled style="display:none">▶ 继续</button>
+        <button id="scanStopBtn" class="btn ghost" disabled style="display:none">⏹ 停止</button>
+      </div>
+      <div class="progress-block" id="progressWrap" style="display:none">
+        <div class="progress"><div id="bar"></div></div>
+        <div class="prog-label"><span id="stats"></span><span id="pct"></span></div>
+      </div>
+    </div>
+
+    <!-- 2. 概览 -->
+    <div class="card" id="summaryPanel" style="display:none">
+      <div class="card-head"><span class="step">2</span><h2>扫描概览</h2></div>
+      <div class="stat-grid" id="summary"></div>
+      <div id="topFiles" style="margin-top:16px"></div>
+    </div>
+
+    <!-- 3. 浏览与勾选 -->
+    <div class="card" id="treePanel" style="display:none">
+      <div class="card-head">
+        <span class="step">3</span><h2>浏览并勾选要恢复的文件 / 目录</h2>
+        <span class="hint-inline">点击文件夹名或 ▸ 展开</span>
+      </div>
+      <div class="tree-toolbar">
+        <input id="search" type="text" placeholder="🔍 搜索文件名（回车）…">
+        <button id="clearSearch" class="btn ghost">清除</button>
+        <button id="selectAllTop" class="btn ghost">全选顶层</button>
+        <button id="unselectAll" class="btn ghost">清空勾选</button>
+      </div>
+      <div id="tree"></div>
+    </div>
+
+    <!-- 4. 恢复 -->
+    <div class="card" id="recoverPanel" style="display:none">
+      <div class="card-head">
+        <span class="step">4</span><h2>恢复选中的文件</h2>
+        <span class="hint-inline">可随时暂停 / 继续 / 停止</span>
+      </div>
+      <div class="form-row">
+        <div class="field" style="flex:1 1 100%">
+          <label>输出目录</label>
+          <input id="outputDir" type="text" readonly placeholder="点击“浏览”选择恢复目录（必须是另一块磁盘）">
+          <button id="browseBtn" class="btn ghost">📂 浏览</button>
+        </div>
+      </div>
+      <div class="hint">
+        已勾选 <b id="selCount">0</b> 项 · 预计数据量 <b id="estSize">0 B</b> ·
+        目标盘可用空间 <b id="destFree">—</b>
+        <span id="spaceWarn" class="danger-note" style="display:none">⚠️ 空间不足，请选择其他磁盘</span>
+        <span id="sameDiskWarn" class="danger-note" style="display:none">⛔ 不能选择源磁盘</span>
+      </div>
+      <div class="controls">
+        <button id="recoverBtn" class="btn green" disabled>⬇️ 开始恢复</button>
+        <button id="pauseBtn" class="btn amber" disabled>⏸ 暂停</button>
+        <button id="resumeBtn" class="btn green" disabled>▶ 继续</button>
+        <button id="stopBtn" class="btn ghost" disabled>⏹ 停止</button>
+      </div>
+      <div class="progress-block" id="recoverWrap" style="display:none">
+        <div class="progress green"><div id="rbar"></div></div>
+        <div class="prog-label"><span id="rstats"></span><span id="rpct"></span></div>
+        <div class="curfile" id="curFile">正在准备…</div>
+        <div class="thin"><div id="rfilebar"></div></div>
+      </div>
+    </div>
+
+  </div>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <span>fsrec v1.0.0 · NTFS 数据恢复工具</span>
+      <span class="footer-sep">·</span>
+      <span>扫描阶段只读，绝不写入源盘；恢复需手动确认</span>
+      <span class="footer-sep">·</span>
+      <a id="footerDisclaimer">免责声明</a>
+    </div>
+  </footer>
+
+  <!-- 目录选择器 -->
+  <div class="modal" id="pickerModal" style="display:none">
+    <div class="modal-box">
+      <div class="modal-head">选择恢复目录 <button class="modal-x" id="closePick">✕</button></div>
+      <div class="picker-drives" id="pickerDrives"></div>
+      <div class="picker-path" id="pickerPath">—</div>
+      <div class="picker-list" id="pickerList"><div class="empty">加载中…</div></div>
+      <div class="picker-foot">
+        <input id="newFolderName" type="text" placeholder="新建文件夹名">
+        <button id="mkdirBtn" class="btn ghost">➕ 新建文件夹</button>
+        <span style="flex:1"></span>
+        <button id="cancelPick" class="btn ghost">取消</button>
+        <button id="confirmPick" class="btn primary">选择此目录</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 帮助 -->
+  <div class="modal" id="helpModal" style="display:none">
+    <div class="modal-box">
+      <div class="modal-head">帮助 <button class="modal-x" id="closeHelp">✕</button></div>
+      <div class="help-body">
+        <h3>操作流程</h3>
+        <ol>
+          <li><b>选择物理磁盘</b>：勾选确认后点击「只读扫描定位」，程序只读解析整盘各分区的 $MFT。</li>
+          <li><b>加载扫描结果</b>：在「已保存的扫描」里点「加载此扫描」查看该分区的文件清单。</li>
+          <li><b>勾选要恢复的文件 / 目录</b>：可用搜索、全选 / 清空；已删除且不可恢复的项会标注。</li>
+          <li><b>选择输出目录并恢复</b>：点「浏览」选目录（必须在<b>另一块磁盘</b>），确认后开始，可随时暂停 / 继续 / 停止。</li>
+        </ol>
+        <h3>注意事项</h3>
+        <ul>
+          <li class="warn">源盘全程<b>只读</b>，绝不写入；请勿在存有重要数据的生产机上随意测试。</li>
+          <li class="warn">严禁选择<b>磁盘 0 / 系统盘</b>作为扫描对象。</li>
+          <li class="warn">恢复输出目录必须位于<b>另一块磁盘</b>，否则会覆盖源数据。</li>
+          <li>已删除文件的数据区可能已被覆写，无法保证完整恢复；「不可恢复」项会明确标注。</li>
+          <li>目标已存在同名文件时自动追加 <code>_1</code>、<code>_2</code>… 后缀，不覆盖。</li>
+          <li>恢复需管理员权限（UAC），启动后浏览器自动打开。</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- 关于 -->
+  <div class="modal" id="aboutModal" style="display:none">
+    <div class="modal-box">
+      <div class="modal-head">关于 <button class="modal-x" id="closeAbout">✕</button></div>
+      <div class="help-body">
+        <h3>fsrec v1.0.0</h3>
+        <p>一款 NTFS 数据恢复工具：通过 Windows 原始磁盘读取接口解析 NTFS 文件系统，
+        重建目录树，帮助你在硬盘被误格式化、分区被覆盖或文件被删除后，浏览并恢复文件与目录结构。</p>
+        <h3>技术栈</h3>
+        <p>C++17 · libuvcpp（HTTP/WebSocket）· nlohmann/json · Windows 原始磁盘读取接口</p>
+        <h3>开源地址</h3>
+        <p><a href="https://github.com/Antruly/fsrec" target="_blank" rel="noopener">https://github.com/Antruly/fsrec</a></p>
+        <p class="muted">MIT 开源许可证</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- 免责声明 -->
+  <div class="modal" id="disclaimerModal" style="display:none">
+    <div class="modal-box">
+      <div class="modal-head">免责声明 <button class="modal-x" id="closeDisclaimer">✕</button></div>
+      <div class="help-body">
+        <h3>免责声明</h3>
+        <p>本工具仅供恢复<b>本人拥有或已获合法授权</b>的数据。恢复结果不保证完整性与可用性，
+        使用风险由用户自行承担。请勿用于任何非法用途。详见安装目录 <code>docs\免责声明.md</code>。</p>
+        <p class="warn">扫描阶段只读，绝不写入源盘；恢复阶段需你手动勾选文件、填写输出目录并再次确认后才开始。
+        误操作（如将输出目录选在源盘）可能导致数据永久丢失，后果由使用者自行承担。</p>
+      </div>
+    </div>
+  </div>
+
+<script>
+const API = ''; // same origin: the backend serves both the API and this page
+let rootTree = null;
+let currentTaskId = null;
+let flatByName = null;   // Map lowercased name -> array of {node, path}
+let checked = new Set();  // root-relative paths explicitly selected
+let diskList = [];
+let selectedDiskNumber = null;
+let currentDiskNumber = null;  // physical disk of the loaded scan (the SOURCE disk)
+let currentJobId = null;
+let currentScanTaskId = null;
+let ws = null;
+let pickPath = '';   // current directory in the picker
+
+const $ = (id) => document.getElementById(id);
+
+function fmtBytes(n) {
+  if (n == null) return '';
+  n = Number(n) || 0;
+  if (n === 0) return '0 B';
+  const u = ['B','KB','MB','GB','TB'];
+  let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (n >= 100 || i === 0 ? n.toFixed(0) : n.toFixed(1)) + ' ' + u[i];
+}
+function fmtTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso); if (isNaN(d)) return iso;
+  const p = (x) => String(x).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function apiGet(path) {
+  const r = await fetch(API + path);
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j;
+}
+async function apiPost(path, body) {
+  const r = await fetch(API + path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {})
+  });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j;
+}
+
+// ---------------------------------------------------------------------------
+// Disks + saved scans
+// ---------------------------------------------------------------------------
+async function loadDisks() {
+  try {
+    diskList = await apiGet('/api/physical_disks');
+    const grid = $('diskGrid');
+    grid.innerHTML = '';
+    for (const d of diskList) {
+      const isSys = d.disk_number === 0;
+      const card = document.createElement('button');
+      card.type = 'button';
+      card.className = 'disk-card' + (isSys ? ' disabled' : '');
+      card.disabled = isSys;
+      card.innerHTML =
+        `<div class="disk-num">磁盘 ${d.disk_number}</div>` +
+        `<div class="disk-model">${esc(d.model || '未知设备')}</div>` +
+        `<div class="disk-size">${fmtBytes(d.size)}</div>` +
+        (isSys ? '<div class="disk-badge sys">⛔ 系统盘 · 禁止</div>' : '<div class="disk-badge ok">可安全选择</div>');
+      card.addEventListener('click', () => {
+        if (isSys) return;
+        selectedDiskNumber = d.disk_number;
+        grid.querySelectorAll('.disk-card').forEach(c => c.classList.remove('selected'));
+        card.classList.add('selected');
+        toggleScanEnabled();
+      });
+      grid.appendChild(card);
+    }
+    if (!diskList.length) grid.innerHTML = '<div class="empty">未检测到物理磁盘（请以管理员身份运行）</div>';
+  } catch (e) {
+    $('diskGrid').innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>';
+  }
+}
+
+async function loadSavedScans() {
+  let list;
+  try { list = await apiGet('/api/scans'); }
+  catch (e) { return; }
+  if (!list || !list.length) return;
+  $('savedPanel').style.display = '';
+  const wrap = $('savedList');
+  wrap.innerHTML = '';
+  for (const s of list) {
+    const item = document.createElement('div');
+    item.className = 'saved-item';
+    const diskLabel = diskList.find(d => d.disk_number === s.disk_number);
+    // task_id "disk1_v0" → 磁盘 1 · 分区 1; legacy "disk1" → 磁盘 1.
+    const m = /^disk(\d+)_v(\d+)$/.exec(s.task_id);
+    const volLabel = m ? `磁盘 ${s.disk_number} · 分区 ${Number(m[2]) + 1}` : `磁盘 ${s.disk_number}`;
+    const offLabel = s.volume_start ? ` · 分区偏移 ${fmtBytes(s.volume_start)}` : '';
+    const info = document.createElement('span');
+    info.className = 'info';
+    info.innerHTML =
+      `<b>${volLabel}</b>` + (diskLabel ? ` · ${esc(diskLabel.model)}` : '') +
+      ` — 文件 <b>${s.total_files}</b> · 目录 <b>${s.directories}</b> · 已删除 <b>${s.deleted_files}</b>` +
+      `<span class="muted">${offLabel} · 簇 ${s.cluster_size} B</span>`;
+    const btn = document.createElement('button');
+    btn.className = 'btn primary';
+    btn.textContent = '加载此扫描';
+    btn.addEventListener('click', () => loadResults(s.task_id, s.disk_number));
+    item.appendChild(info);
+    item.appendChild(btn);
+    wrap.appendChild(item);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Scan
+// ---------------------------------------------------------------------------
+function toggleScanEnabled() {
+  $('scanBtn').disabled = !(selectedDiskNumber != null && $('confirm').checked);
+}
+$('confirm').addEventListener('change', toggleScanEnabled);
+
+async function onScan() {
+  if (selectedDiskNumber == null) return;
+  $('scanBtn').disabled = true;
+  $('progressWrap').style.display = '';
+  setStep(2);
+  $('bar').style.width = '0%';
+  $('pct').textContent = '';
+  $('stats').textContent = '正在扫描整盘、定位所有分区 $MFT…（约 3–10 分钟）';
+  try {
+    const j = await apiPost('/api/raw_scan_all', { disk_number: selectedDiskNumber });
+    currentScanTaskId = j.task_id;
+    setScanControls('running');
+    // Live progress arrives over WebSocket; fall back to polling only if the
+    // socket is down so the UI is never silently stuck at 0%.
+    if (!ws || ws.readyState !== WebSocket.OPEN) pollScanAll(j.task_id);
+  } catch (e) {
+    $('stats').textContent = '启动失败：' + e.message;
+    toggleScanEnabled();
+  }
+}
+
+function setScanControls(state) {
+  if (state === 'done') {
+    $('scanBtn').style.display = '';
+    $('scanPauseBtn').style.display = 'none';
+    $('scanResumeBtn').style.display = 'none';
+    $('scanStopBtn').style.display = 'none';
+    return;
+  }
+  const running = state === 'running', paused = state === 'paused';
+  $('scanBtn').style.display = 'none';
+  $('scanPauseBtn').style.display = '';
+  $('scanResumeBtn').style.display = '';
+  $('scanStopBtn').style.display = '';
+  $('scanPauseBtn').disabled = !running;
+  $('scanResumeBtn').disabled = !paused;
+  $('scanStopBtn').disabled = !(running || paused);
+}
+
+async function scanControl(action) {
+  if (!currentScanTaskId) return;
+  try { await apiPost(`/api/scan/${currentScanTaskId}/${action}`, {}); }
+  catch (e) { alert(e.message); }
+}
+
+function applyScanState(s) {
+  const st = s.status;
+  $('bar').style.width = (s.progress || 0) + '%';
+  $('pct').textContent = (s.progress || 0) + '%';
+  if (st === 'completed' || st === 'failed' || st === 'stopped') { finishScan(s); return; }
+  if (st === 'paused') {
+    $('stats').innerHTML = `<span style="color:var(--amber)">⏸ 扫描已暂停</span> · 已定位 <b>${s.total_files}</b> 个文件 · <b>${s.directories}</b> 个目录`;
+    setScanControls('paused');
+    return;
+  }
+  setScanControls('running');
+  let stats = `正在扫描… 已定位 <b>${s.total_files}</b> 个文件 · <b>${s.directories}</b> 个目录`;
+  if (s.current_path) {
+    stats = `正在扫描 <b>${esc(s.current_path)}</b> · 已定位 <b>${s.total_files}</b> 个文件 · <b>${s.directories}</b> 个目录`;
+  }
+  $('stats').innerHTML = stats;
+}
+
+async function finishScan(s) {
+  currentScanTaskId = null;
+  setScanControls('done');
+  if (s.status === 'completed') {
+    $('bar').style.width = '100%';
+    $('pct').textContent = '100%';
+    $('stats').innerHTML =
+      `<span style="color:var(--green)">✓ 扫描完成</span>：共定位 <b>${s.total_files}</b> 个文件 · <b>${s.directories}</b> 个目录` +
+      `<span class="muted"> · 下方已按分区列出，点击“加载此扫描”逐区查看</span>`;
+    await loadSavedScans();
+  } else if (s.status === 'stopped') {
+    $('stats').innerHTML = `<span style="color:var(--amber)">⏹ 扫描已停止</span> · 已定位 <b>${s.total_files}</b> 个文件 · <b>${s.directories}</b> 个目录`;
+  } else {
+    $('stats').textContent = '扫描失败：' + (s.error || '');
+  }
+  toggleScanEnabled();
+}
+
+function pollScanAll(taskId) {
+  const t = setInterval(async () => {
+    let s;
+    try { s = await apiGet(`/api/scan/${taskId}/status`); }
+    catch (e) { clearInterval(t); $('stats').textContent = '状态查询失败：' + e.message; currentScanTaskId = null; setScanControls('done'); toggleScanEnabled(); return; }
+    if (s.status === 'completed' || s.status === 'failed' || s.status === 'stopped') {
+      clearInterval(t);
+      finishScan(s);
+    } else {
+      applyScanState(s);
+    }
+  }, 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Results + tree
+// ---------------------------------------------------------------------------
+async function loadResults(taskId, disk) {
+  try {
+    const tree = await apiGet(`/api/scan/${taskId}/results`);
+    rootTree = tree;
+    currentTaskId = taskId;
+    currentDiskNumber = disk;
+    checked = new Set();
+    buildIndex();
+    renderSummary();
+    renderTopLevel();
+    $('summaryPanel').style.display = '';
+    $('treePanel').style.display = '';
+    $('recoverPanel').style.display = '';
+    setStep(3);
+    $('pct').textContent = '100%';
+    $('stats').innerHTML = '<span style="color:var(--green)">✓ 扫描完成，清单已加载</span>';
+    updateSelCount();
+    loadSavedScans();
+  } catch (e) {
+    $('stats').textContent = '加载清单失败：' + e.message;
+  } finally {
+    toggleScanEnabled();
+  }
+}
+
+function walk(node, path, fn) {
+  fn(node, path);
+  for (const c of node.children || []) walk(c, path + '/' + c.name, fn);
+}
+
+function buildIndex() {
+  flatByName = new Map();
+  walk(rootTree, '', (n, p) => {
+    const k = (n.name || '').toLowerCase();
+    if (!k) return;
+    if (!flatByName.has(k)) flatByName.set(k, []);
+    flatByName.get(k).push({ node: n, path: p });
+  });
+}
+
+function renderSummary() {
+  const files = [];
+  let dirs = 0;
+  walk(rootTree, '', (n) => {
+    if (n.type === 'file' && n.size) files.push(n);
+    if (n.type === 'folder') dirs++;
+  });
+  files.sort((a, b) => (b.size || 0) - (a.size || 0));
+  const inuse = files.filter(f => !f.is_deleted);
+  const del = files.filter(f => f.is_deleted);
+  const sum = (arr) => arr.reduce((a, f) => a + (f.size || 0), 0);
+
+  const stats = [
+    ['文件总数', inuse.length + del.length, ''],
+    ['目录', dirs, ''],
+    ['已删除文件', del.length, 'danger'],
+    ['现存总量', fmtBytes(sum(inuse)), 'accent'],
+    ['已删除总量', fmtBytes(sum(del)), 'danger'],
+  ];
+  $('summary').innerHTML = stats.map(([k, v, cls]) =>
+    `<div class="stat"><div class="k">${k}</div><div class="v ${cls}">${v}</div></div>`
+  ).join('');
+
+  const top = files.slice(0, 8);
+  $('topFiles').innerHTML =
+    `<div class="muted" style="margin-bottom:8px">最大的文件：</div>` +
+    top.map((f, i) =>
+      `<div class="node"><span class="icon">📄</span>` +
+      `<span class="name" style="flex:1" title="${esc(f.name)}">${i+1}. ${esc(f.name)}</span>` +
+      `<span class="meta">${fmtBytes(f.size)}${f.is_deleted ? ' · 已删除' : ''}</span></div>`
+    ).join('');
+}
+
+function nodeRow(n, depth, path, ancestorChecked) {
+  const isDir = n.type === 'folder';
+  const wrap = document.createElement('div');
+  wrap.className = 'node-wrap';
+
+  const el = document.createElement('div');
+  el.className = 'node' + (n.is_deleted ? ' deleted' : '');
+
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  const effective = ancestorChecked || checked.has(path);
+  cb.checked = effective;
+  cb.addEventListener('change', () => {
+    if (cb.checked) checked.add(path);
+    else checked.delete(path);
+    renderTopLevel();
+    updateSelCount();
+  });
+  el.appendChild(cb);
+
+  const arrow = document.createElement('span');
+  arrow.className = 'arrow' + (isDir ? '' : ' leaf');
+  arrow.textContent = isDir ? '▸' : '';
+  el.appendChild(arrow);
+
+  const icon = document.createElement('span');
+  icon.className = 'icon';
+  icon.textContent = isDir ? '📁' : '📄';
+  el.appendChild(icon);
+
+  const name = document.createElement('span');
+  name.className = 'name';
+  name.textContent = n.name;
+  name.title = n.name;
+  el.appendChild(name);
+
+  if (n.is_deleted) {
+    const tag = document.createElement('span'); tag.className = 'tag del'; tag.textContent = '已删除'; el.appendChild(tag);
+  }
+  if (!isDir && n.is_deleted && !n.recoverable) {
+    const tag = document.createElement('span'); tag.className = 'tag norec'; tag.textContent = '不可恢复'; el.appendChild(tag);
+  }
+
+  const meta = document.createElement('span');
+  meta.className = 'meta';
+  meta.textContent = (isDir ? (n.children ? n.children.length + ' 项' : '') : fmtBytes(n.size)) + (n.modified_time ? ' · ' + fmtTime(n.modified_time) : '');
+  el.appendChild(meta);
+
+  wrap.appendChild(el);
+
+  if (isDir) {
+    const childWrap = document.createElement('div');
+    childWrap.className = 'children';
+    childWrap.style.display = 'none';
+    let loaded = false;
+    const toggle = () => {
+      if (!loaded) {
+        loaded = true;
+        if (n.children && n.children.length) {
+          childWrap.appendChild(renderChildren(n.children, depth + 1, path, effective));
+        } else {
+          const e2 = document.createElement('div'); e2.className = 'muted'; e2.textContent = '（空目录）'; childWrap.appendChild(e2);
+        }
+      }
+      const open = childWrap.style.display === 'none';
+      childWrap.style.display = open ? '' : 'none';
+      arrow.textContent = open ? '▾' : '▸';
+    };
+    arrow.addEventListener('click', toggle);
+    name.addEventListener('click', toggle);
+    wrap.appendChild(childWrap);
+  }
+  return wrap;
+}
+
+function renderChildren(children, depth, parentPath, ancestorChecked) {
+  const sorted = [...children].sort((a, b) => {
+    if (a.type === 'folder' && b.type !== 'folder') return -1;
+    if (a.type !== 'folder' && b.type === 'folder') return 1;
+    return (a.name || '').localeCompare(b.name || '', 'zh');
+  });
+  const frag = document.createDocumentFragment();
+  for (const c of sorted) {
+    const childPath = parentPath ? parentPath + '/' + c.name : '/' + c.name;
+    const eff = ancestorChecked || checked.has(childPath);
+    frag.appendChild(nodeRow(c, depth, childPath, eff));
+  }
+  return frag;
+}
+
+function renderTopLevel() {
+  const tree = $('tree');
+  tree.innerHTML = '';
+  const kids = rootTree.children || [];
+  tree.appendChild(renderChildren(kids, 0, '', false));
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+function doSearch() {
+  const kw = $('search').value.trim().toLowerCase();
+  if (!kw) { renderTopLevel(); return; }
+  const matches = [];
+  for (const [name, arr] of flatByName) {
+    if (name.includes(kw)) matches.push(...arr);
+  }
+  const tree = $('tree');
+  tree.innerHTML = '';
+  if (!matches.length) {
+    const e = document.createElement('div'); e.className = 'empty'; e.textContent = '未找到匹配 "' + kw + '" 的文件'; tree.appendChild(e); return;
+  }
+  const e2 = document.createElement('div'); e2.className = 'muted';
+  e2.textContent = `匹配 ${matches.length} 项` + (matches.length > 500 ? '（仅显示前 500 项）' : '') + '：';
+  tree.appendChild(e2);
+  const frag = document.createDocumentFragment();
+  for (const m of matches.slice(0, 500)) {
+    const row = nodeRow(m.node, 0, m.path, checked.has(m.path));
+    row.querySelector('.name').title = m.path; // show full path on hover in search results
+    frag.appendChild(row);
+  }
+  tree.appendChild(frag);
+}
+$('search').addEventListener('keydown', (e) => { if (e.key === 'Enter') doSearch(); });
+$('clearSearch').addEventListener('click', () => { $('search').value = ''; renderTopLevel(); });
+
+// ---------------------------------------------------------------------------
+// Selection helpers
+// ---------------------------------------------------------------------------
+function topmostCheckedPaths() {
+  const result = [];
+  for (const p of checked) {
+    let redundant = false;
+    let idx = p.lastIndexOf('/');
+    while (idx > 0) {
+      const anc = p.slice(0, idx);
+      if (checked.has(anc)) { redundant = true; break; }
+      idx = anc.lastIndexOf('/');
+    }
+    if (!redundant) result.push(p);
+  }
+  return result;
+}
+// Resolve a root-relative path ("/Folder/Sub") to its node in the tree.
+function findNode(path) {
+  if (!path || path === '/') return rootTree;
+  let cur = rootTree;
+  for (const seg of path.split('/').filter(Boolean)) {
+    const next = (cur.children || []).find(c => c.name === seg);
+    if (!next) return null;
+    cur = next;
+  }
+  return cur;
+}
+function sizeOf(node) {
+  if (!node) return 0;
+  if (node.type === 'file') return node.size || 0;
+  let s = 0;
+  for (const c of node.children || []) s += sizeOf(c);
+  return s;
+}
+function computeSelectedSize() {
+  let total = 0;
+  for (const p of topmostCheckedPaths()) total += sizeOf(findNode(p));
+  return total;
+}
+
+function updateSelCount() {
+  const n = topmostCheckedPaths().length;
+  $('selCount').textContent = n;
+  $('estSize').textContent = fmtBytes(computeSelectedSize());
+  $('recoverBtn').disabled = n === 0 || !$('outputDir').value.trim();
+  evaluateSpace();
+}
+
+// Compare the estimated recovery size against the destination's free space.
+async function evaluateSpace() {
+  $('spaceWarn').style.display = 'none';
+  $('sameDiskWarn').style.display = 'none';
+  const out = $('outputDir').value.trim();
+  if (!out) { $('destFree').textContent = '—'; return; }
+  const sz = computeSelectedSize();
+  try {
+    const sp = await apiGet('/api/fs/space?path=' + encodeURIComponent(out));
+    $('destFree').textContent = fmtBytes(sp.free_size);
+    if (sz > 0 && sp.free_size > 0 && sz > sp.free_size) {
+      $('spaceWarn').style.display = '';
+    }
+  } catch (e) {
+    $('destFree').textContent = '未知';
+  }
+}
+
+$('selectAllTop').addEventListener('click', () => {
+  for (const c of rootTree.children || []) checked.add('/' + c.name);
+  renderTopLevel(); updateSelCount();
+});
+$('unselectAll').addEventListener('click', () => {
+  checked = new Set();
+  renderTopLevel(); updateSelCount();
+});
+
+// ---------------------------------------------------------------------------
+// WebSocket status push
+// ---------------------------------------------------------------------------
+function connectWS() {
+  try {
+    const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    ws = new WebSocket(proto + location.host + '/ws');
+    ws.onmessage = (ev) => {
+      let m;
+      try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (m.job_id) {
+        if (m.job_id === currentJobId) applyRecoverState(m);
+        return;
+      }
+      if (m.task_id) {
+        if (m.task_id === currentScanTaskId) applyScanState(m);
+        return;
+      }
+    };
+    ws.onclose = () => setTimeout(connectWS, 2000);
+    ws.onerror = () => { try { ws.close(); } catch (e) {} };
+  } catch (e) { setTimeout(connectWS, 3000); }
+}
+
+function setRecoverControls(state) {
+  const running = state === 'running', paused = state === 'paused';
+  $('pauseBtn').disabled  = !running;
+  $('resumeBtn').disabled = !paused;
+  $('stopBtn').disabled   = !(running || paused);
+  $('recoverBtn').disabled = (running || paused)
+    ? true
+    : (topmostCheckedPaths().length === 0 || !$('outputDir').value.trim());
+}
+
+function applyRecoverState(s) {
+  const st = s.status;
+  $('rbar').style.width = (s.progress || 0) + '%';
+  $('rpct').textContent = (s.progress || 0) + '%';
+
+  if (st === 'running' || st === 'paused') {
+    $('rstats').innerHTML =
+      `成功 <b>${s.recovered_files}</b> · 失败 <b>${s.failed_files}</b> · 共 <b>${s.total_files}</b>` +
+      (s.total_bytes ? ` <span class="muted">${fmtBytes(s.recovered_bytes)} / ${fmtBytes(s.total_bytes)}</span>` : '');
+    const fsize = s.current_size || 0;
+    const fdone = s.current_bytes || 0;
+    if (s.current_file) {
+      $('curFile').innerHTML =
+        `正在恢复 <b>${esc(s.current_file)}</b>` +
+        (fsize ? ` <span class="muted">${fmtBytes(fdone)} / ${fmtBytes(fsize)}</span>` : '');
+      $('rfilebar').style.width = (fsize ? Math.min(100, Math.round(fdone * 100 / fsize)) : 0) + '%';
+    } else {
+      $('curFile').textContent = '准备中…';
+      $('rfilebar').style.width = '0%';
+    }
+    setRecoverControls(st === 'paused' ? 'paused' : 'running');
+  } else if (st === 'completed') {
+    $('rpct').textContent = '100%';
+    $('rbar').style.width = '100%';
+    $('rstats').innerHTML = `<span style="color:var(--green)">✓ 恢复完成</span> · 成功 <b>${s.recovered_files}</b> · 失败 <b>${s.failed_files}</b>`;
+    $('curFile').textContent = '已完成';
+    $('rfilebar').style.width = '100%';
+    setRecoverControls('done');
+  } else if (st === 'stopped') {
+    $('rstats').innerHTML = `<span style="color:var(--amber)">⏹ 已停止</span> · 成功 <b>${s.recovered_files}</b> · 失败 <b>${s.failed_files}</b>`;
+    $('curFile').textContent = '已停止';
+    setRecoverControls('done');
+  } else if (st === 'failed') {
+    $('rstats').textContent = '恢复失败：' + (s.error || '');
+    $('curFile').textContent = '失败';
+    setRecoverControls('done');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Recover
+// ---------------------------------------------------------------------------
+async function onRecover() {
+  const paths = topmostCheckedPaths();
+  const outputDir = $('outputDir').value.trim();
+  if (!paths.length) return;
+  if (!outputDir) { alert('请先浏览选择输出目录'); return; }
+  const est = computeSelectedSize();
+  if (!confirm(`确认恢复 ${paths.length} 项（约 ${fmtBytes(est)}）到：\n${outputDir}\n\n请再次确认该目录位于另一块磁盘，且不会覆盖源盘数据。`)) return;
+
+  $('recoverWrap').style.display = '';
+  $('rbar').style.width = '0%';
+  $('rfilebar').style.width = '0%';
+  $('rpct').textContent = '';
+  $('curFile').textContent = '正在启动…';
+  $('rstats').textContent = '正在启动恢复任务…';
+  setRecoverControls('running');
+  setStep(4);
+  try {
+    const j = await apiPost('/api/recover', {
+      task_id: currentTaskId, selected_paths: paths, output_dir: outputDir
+    });
+    currentJobId = j.job_id;
+    // Pull once so the UI reflects state immediately even before the first WS frame.
+    try { applyRecoverState(await apiGet(`/api/recover/${j.job_id}/status`)); } catch (e) {}
+  } catch (e) {
+    $('rstats').textContent = '启动恢复失败：' + e.message;
+    setRecoverControls('done');
+  }
+}
+
+async function recoverControl(action) {
+  if (!currentJobId) return;
+  try { await apiPost(`/api/recover/${currentJobId}/${action}`, {}); }
+  catch (e) { alert(e.message); }
+}
+
+// ---------------------------------------------------------------------------
+// Output directory picker
+// ---------------------------------------------------------------------------
+async function openPicker() {
+  $('pickerModal').style.display = 'flex';
+  pickPath = '';
+  $('pickerPath').textContent = '请选择磁盘';
+  $('pickerList').innerHTML = '<div class="empty">请先选择上方磁盘</div>';
+  renderPickerDrives();
+}
+
+async function renderPickerDrives() {
+  let drives;
+  try { drives = await apiGet('/api/fs/drives'); }
+  catch (e) { $('pickerDrives').innerHTML = '<span class="muted">加载磁盘失败</span>'; return; }
+  const wrap = $('pickerDrives');
+  wrap.innerHTML = '';
+  for (const d of drives) {
+    const blocked = Array.isArray(d.physical_disks) && d.physical_disks.includes(currentDiskNumber);
+    const chip = document.createElement('div');
+    const active = pickPath && pickPath.toUpperCase().startsWith(d.letter.toUpperCase());
+    chip.className = 'drive-chip' + (blocked ? ' blocked' : '') + (active ? ' active' : '');
+    chip.textContent = `${d.letter}${d.label ? ' ' + d.label : ''} · ${fmtBytes(d.free_size)}`;
+    chip.title = blocked ? '源磁盘，禁止选择' : d.letter + ' ' + (d.label || '');
+    if (!blocked) chip.addEventListener('click', () => navigatePicker(d.letter + '\\'));
+    wrap.appendChild(chip);
+  }
+}
+
+async function navigatePicker(path) {
+  pickPath = path;
+  $('pickerPath').textContent = path;
+  renderPickerDrives();
+  let list;
+  try { list = await apiGet('/api/fs/list?path=' + encodeURIComponent(path)); }
+  catch (e) { $('pickerList').innerHTML = '<div class="empty">无法读取：' + esc(e.message) + '</div>'; return; }
+  const wrap = $('pickerList');
+  wrap.innerHTML = '';
+  if (!list.ok) { wrap.innerHTML = '<div class="empty">' + esc(list.error || '无法读取') + '</div>'; return; }
+  if (list.parent) {
+    const up = document.createElement('div');
+    up.className = 'picker-item';
+    up.innerHTML = '<span class="icon">📁</span><span>..（上级目录）</span>';
+    up.addEventListener('click', () => navigatePicker(list.parent));
+    wrap.appendChild(up);
+  }
+  if (!list.entries.length) {
+    const e = document.createElement('div'); e.className = 'empty'; e.textContent = '（空目录）'; wrap.appendChild(e);
+  }
+  for (const ent of list.entries) {
+    const it = document.createElement('div');
+    it.className = 'picker-item';
+    it.innerHTML = '<span class="icon">📁</span><span>' + esc(ent.name) + '</span>';
+    it.addEventListener('click', () => navigatePicker(ent.path));
+    wrap.appendChild(it);
+  }
+}
+
+async function onMkdir() {
+  const name = $('newFolderName').value.trim();
+  if (!name) return;
+  if (!pickPath) { alert('请先选择一个磁盘'); return; }
+  try {
+    const j = await apiPost('/api/fs/mkdir', { path: pickPath, name });
+    $('newFolderName').value = '';
+    navigatePicker(j.path);
+  } catch (e) { alert('新建文件夹失败：' + e.message); }
+}
+
+function confirmPick() {
+  if (!pickPath) { alert('请选择一个磁盘或目录'); return; }
+  $('outputDir').value = pickPath;
+  $('pickerModal').style.display = 'none';
+  updateSelCount();
+}
+
+$('scanBtn').addEventListener('click', onScan);
+$('scanPauseBtn').addEventListener('click', () => scanControl('pause'));
+$('scanResumeBtn').addEventListener('click', () => scanControl('resume'));
+$('scanStopBtn').addEventListener('click', () => { if (confirm('确定要停止扫描吗？已定位的分区结果会保留，当前分区不保存。')) scanControl('stop'); });
+$('recoverBtn').addEventListener('click', onRecover);
+$('pauseBtn').addEventListener('click', () => recoverControl('pause'));
+$('resumeBtn').addEventListener('click', () => recoverControl('resume'));
+$('stopBtn').addEventListener('click', () => { if (confirm('确定要停止恢复吗？已写入的文件会保留。')) recoverControl('stop'); });
+$('browseBtn').addEventListener('click', openPicker);
+$('closePick').addEventListener('click', () => { $('pickerModal').style.display = 'none'; });
+$('cancelPick').addEventListener('click', () => { $('pickerModal').style.display = 'none'; });
+$('confirmPick').addEventListener('click', confirmPick);
+$('mkdirBtn').addEventListener('click', onMkdir);
+$('newFolderName').addEventListener('keydown', (e) => { if (e.key === 'Enter') onMkdir(); });
+
+// ---------------------------------------------------------------------------
+// Connection status + step indicator + help / about modal
+// ---------------------------------------------------------------------------
+function setConn(ok) {
+  const el = $('connStatus');
+  el.classList.toggle('ok', ok);
+  el.classList.toggle('bad', !ok);
+  $('connText').textContent = ok ? '服务已连接' : '服务未连接';
+}
+async function heartbeat() {
+  try { const j = await apiGet('/ping'); setConn(j.status === 'ok'); }
+  catch (e) { setConn(false); }
+}
+setInterval(heartbeat, 5000);
+
+function setStep(n) {
+  document.querySelectorAll('#steps .step-item').forEach(it => {
+    const s = Number(it.dataset.step);
+    it.classList.toggle('done', s < n);
+    it.classList.toggle('active', s === n);
+  });
+}
+
+function openModal(id) { $(id).style.display = 'flex'; }
+function closeModal(id) { $(id).style.display = 'none'; }
+$('helpBtn').addEventListener('click', () => openModal('helpModal'));
+$('aboutBtn').addEventListener('click', () => openModal('aboutModal'));
+$('disclaimerBtn').addEventListener('click', () => openModal('disclaimerModal'));
+$('footerDisclaimer').addEventListener('click', () => openModal('disclaimerModal'));
+$('closeHelp').addEventListener('click', () => closeModal('helpModal'));
+$('closeAbout').addEventListener('click', () => closeModal('aboutModal'));
+$('closeDisclaimer').addEventListener('click', () => closeModal('disclaimerModal'));
+['helpModal', 'aboutModal', 'disclaimerModal'].forEach((id) => {
+  $(id).addEventListener('click', (e) => { if (e.target === $(id)) closeModal(id); });
+});
+
+heartbeat();
+connectWS();
+loadDisks();
+loadSavedScans();
+</script>
+</body>
+</html>
