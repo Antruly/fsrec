@@ -122,6 +122,14 @@ std::shared_ptr<RecoverJob> Restorer::get_job(const std::string& id) {
     return it->second;
 }
 
+std::vector<std::shared_ptr<RecoverJob>> Restorer::list_jobs() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::shared_ptr<RecoverJob>> out;
+    out.reserve(jobs_.size());
+    for (const auto& kv : jobs_) out.push_back(kv.second);
+    return out;
+}
+
 bool Restorer::pause(const std::string& id) {
     auto job = get_job(id);
     if (!job) return false;

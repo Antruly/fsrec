@@ -51,6 +51,10 @@ public:
     // "\\\\.\\PhysicalDrive1").
     const std::string& drive() const { return drive_; }
 
+    // Physical disk index this reader is bound to, or -1 when the reader was
+    // opened on a drive-letter volume (whose physical disk is unknown).
+    int disk_number() const { return disk_number_; }
+
     // Total size in bytes of the physical disk (0 if unknown).
     uint64_t physical_size() const { return physical_size_; }
 
@@ -63,6 +67,17 @@ private:
     std::string drive_;
     uint64_t base_offset_ = 0;
     uint64_t physical_size_ = 0;
+    int disk_number_ = -1;
 };
+
+// Cumulative raw bytes actually read across every DiskReader in this process
+// (scan + recover + candidate search). Used to derive a live read-throughput
+// figure for the UI. Thread-safe (atomic).
+uint64_t total_bytes_read();
+
+// Cumulative raw bytes read from a single physical disk (indexed by
+// PhysicalDriveN number). Returns 0 for an out-of-range index. Used by the
+// per-disk live-activity chart in the UI. Thread-safe (atomic).
+uint64_t disk_bytes_read(int disk_number);
 
 } // namespace recovery

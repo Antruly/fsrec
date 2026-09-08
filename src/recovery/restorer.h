@@ -57,6 +57,9 @@ public:
 
     std::shared_ptr<RecoverJob> get_job(const std::string& id);
 
+    // Snapshot of all jobs (live + finished), for /api/active listing.
+    std::vector<std::shared_ptr<RecoverJob>> list_jobs();
+
     // Control an in-flight job. Return false if the job is unknown or already
     // finished. `stop` also clears a pending pause so the worker can exit.
     bool pause(const std::string& id);

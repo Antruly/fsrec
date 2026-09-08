@@ -23,6 +23,9 @@ namespace fs = std::filesystem;
 
 #include "../include/util.h"
 #include "../include/version.h"
+#include "../ntfs/disk_reader.h"
+
+#include <handle/uvcpp_timer.h>
 
 using json = nlohmann::json;
 
@@ -416,6 +419,72 @@ void HttpApi::setup(uvcpp::uvcpp_http_server& server,
         });
     }
 
+    // Live system-stats heartbeat: sample the process-wide raw read counter once
+    // a second and push {type:"sys", read_mbps, read_bytes, disks:{...}} to every
+    // WS client. Besides the disk-throughput gauge it doubles as a WS liveness
+    // signal — the read-speed number keeps ticking while a scan runs, so the
+    // browser can tell the socket is genuinely receiving server pushes (not just
+    // "connected") — and carries per-disk read speeds for the Task-Manager-style
+    // chart. Every few ticks it also re-enumerates physical disks and pushes a
+    // {type:"disks", disks:[...]} frame when the set changes (hot-plug/removal),
+    // so the UI reflects newly attached or pulled disks without a refresh.
+    {
+        auto* stats_timer = new uvcpp::uvcpp_timer(server.get_tcp_server()->get_loop());
+        stats_timer->start([this](uvcpp::uvcpp_timer*) {
+            static uint64_t last_bytes = total_bytes_read();
+            static uint64_t last_disk[32] = {0};
+            static std::set<int> last_disk_set;
+            static int tick = 0;
+            static auto last_t = std::chrono::steady_clock::now();
+
+            uint64_t b = total_bytes_read();
+            auto now = std::chrono::steady_clock::now();
+            double dt = std::chrono::duration<double>(now - last_t).count();
+            double mbps = dt > 0.0
+                ? static_cast<double>(b - last_bytes) / dt / (1024.0 * 1024.0)
+                : 0.0;
+            last_bytes = b;
+            last_t = now;
+
+            auto round1 = [](double v) {
+                return static_cast<double>(static_cast<long long>(v * 10.0)) / 10.0;
+            };
+
+            json j;
+            j["type"] = "sys";
+            j["read_mbps"] = round1(mbps);
+            j["read_bytes"] = b;
+
+            json disks = json::object();
+            for (int i = 0; i < 32; i++) {
+                uint64_t db = disk_bytes_read(i);
+                uint64_t prev = last_disk[i];
+                last_disk[i] = db;
+                double dmbps = dt > 0.0
+                    ? static_cast<double>(db - prev) / dt / (1024.0 * 1024.0)
+                    : 0.0;
+                if (db > 0 || prev > 0) disks[std::to_string(i)] = round1(dmbps);
+            }
+            j["disks"] = disks;
+            broadcast(j.dump());
+
+            // Hot-plug detection (every 3s): if the set of visible physical disks
+            // changed, push the fresh list so the UI updates without a refresh.
+            if (++tick % 3 == 0) {
+                json list = enumerate_physical_disks();
+                std::set<int> cur;
+                for (const auto& d : list) cur.insert(d.value("disk_number", -1));
+                if (cur != last_disk_set) {
+                    last_disk_set = cur;
+                    json h;
+                    h["type"] = "disks";
+                    h["disks"] = list;
+                    broadcast(h.dump());
+                }
+            }
+        }, 1000, 1000);
+    }
+
     server.on_request([this, &server](uvcpp::uvcpp_http_request& req,
                                       uvcpp::uvcpp_http_response& resp,
                                       uvcpp::uvcpp_tcp_client* client) {
@@ -484,6 +553,71 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
         // GET /api/physical_disks
         if (r == "physical_disks" && segs.size() == 2 && is_get) {
             set_json(resp, uvcpp::http_status::OK, enumerate_physical_disks().dump());
+            return;
+        }
+
+        // GET /api/active — the running scan coordinator and the running recover
+        // job, so the frontend can restore live progress after a page refresh and
+        // still pause/resume/stop the in-flight work.
+        if (r == "active" && segs.size() == 2 && is_get) {
+            json out;
+            out["scan"] = nullptr;
+            out["recover"] = nullptr;
+
+            // Prefer the raw_scan_all coordinator (meta) task; fall back to any
+            // other running/paused scan.
+            std::shared_ptr<ScanTask> run_scan;
+            for (const auto& t : scanner_.list_tasks()) {
+                std::string st;
+                { std::lock_guard<std::mutex> lock(t->mtx); st = t->status; }
+                if (st != "running" && st != "paused") continue;
+                if (!run_scan || t->meta) run_scan = t;
+                if (t->meta) break;
+            }
+            if (run_scan) {
+                json s;
+                s["task_id"] = run_scan->id;
+                s["progress"] = run_scan->progress.load();
+                s["total_files"] = run_scan->total_files.load();
+                s["directories"] = run_scan->directories.load();
+                s["disk_number"] = run_scan->disk_number;
+                s["raw"] = run_scan->raw;
+                {
+                    std::lock_guard<std::mutex> lock(run_scan->mtx);
+                    s["status"] = run_scan->status;
+                    s["current_path"] = run_scan->current_path;
+                    if (!run_scan->error.empty()) s["error"] = run_scan->error;
+                }
+                out["scan"] = s;
+            }
+
+            std::shared_ptr<RecoverJob> run_job;
+            for (const auto& j : restorer_.list_jobs()) {
+                std::string st;
+                { std::lock_guard<std::mutex> lock(j->mtx); st = j->status; }
+                if (st == "running" || st == "paused") { run_job = j; break; }
+            }
+            if (run_job) {
+                json r;
+                r["job_id"] = run_job->id;
+                r["progress"] = run_job->progress.load();
+                r["total_files"] = run_job->total_files.load();
+                r["recovered_files"] = run_job->recovered_files.load();
+                r["failed_files"] = run_job->failed_files.load();
+                r["total_bytes"] = run_job->total_bytes.load();
+                r["recovered_bytes"] = run_job->recovered_bytes.load();
+                r["output_dir"] = run_job->output_dir;
+                {
+                    std::lock_guard<std::mutex> lock(run_job->mtx);
+                    r["status"] = run_job->status;
+                    r["current_file"] = run_job->current_file;
+                    r["current_bytes"] = run_job->current_bytes;
+                    r["current_size"] = run_job->current_size;
+                    if (!run_job->error.empty()) r["error"] = run_job->error;
+                }
+                out["recover"] = r;
+            }
+            set_json(resp, uvcpp::http_status::OK, out.dump());
             return;
         }
 

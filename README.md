@@ -7,7 +7,7 @@
 通过 Windows 原始磁盘读取接口解析 NTFS 文件系统、重建目录树，支持扫描、搜索与**选择性恢复**已删除或误格式化后仍存留的文件。
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.0.2-brightgreen.svg)](https://github.com/Antruly/fsrec/releases)
+[![Version](https://img.shields.io/badge/version-1.0.3-brightgreen.svg)](https://github.com/Antruly/fsrec/releases)
 [![Language](https://img.shields.io/badge/language-C%2B%2B17-00599C.svg)](#)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-lightgrey.svg)](#)
 
@@ -43,7 +43,8 @@
 - 🗂️ **分区级扫描** — `raw_scan_all` 遍历整盘，定位每个 NTFS 分区并分别缓存
 - 🔎 **搜索过滤** — 前端按名称 / 类型快速筛选
 - ♻️ **选择性恢复** — 保留原目录结构写入输出目录，同名文件自动改名，支持**暂停 / 继续 / 停止**
-- 📡 **实时进度** — WebSocket 推送总体进度 + 当前文件 + 每文件字节进度
+- 📡 **实时进度** — WebSocket 推送总体进度 + 当前文件 + 每文件字节进度；刷新页面后自动恢复进行中的任务
+- 📊 **磁盘监控** — 实时读取速度（全局 + 单盘）、点击磁盘展开**任务管理器风格动态折线图**、磁盘**热插拔**自动刷新并提示任务中断
 - 🛡️ **安全与空间** — 源盘锁定（目录选择器禁用源盘）、空间预估与不足警告
 
 ---
@@ -52,7 +53,7 @@
 
 ### 直接下载（推荐）
 
-从 [Releases](https://github.com/Antruly/fsrec/releases) 下载 `fsrec_Setup_1.0.2.exe`，
+从 [Releases](https://github.com/Antruly/fsrec/releases) 下载 `fsrec_Setup_1.0.3.exe`，
 双击安装（全中文向导）。安装完成后双击桌面 / 开始菜单的 **fsrec** 图标：
 
 1. 自动触发 UAC 提权（`requireAdministrator` 清单）
@@ -88,7 +89,7 @@ recovery_server.exe --no-browser   # 不自动打开浏览器
 
 ```powershell
 curl http://localhost:8080/ping
-# → {"status":"ok","name":"fsrec","version":"1.0.2"}
+# → {"status":"ok","name":"fsrec","version":"1.0.3"}
 ```
 
 ---
@@ -156,7 +157,7 @@ fsrec/
 powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
 ```
 
-产物输出到 `release\fsrec_Setup_1.0.2.exe`（全中文安装向导，安装后生成开始菜单 / 桌面快捷方式，
+产物输出到 `release\fsrec_Setup_1.0.3.exe`（全中文安装向导，安装后生成开始菜单 / 桌面快捷方式，
 双击 exe 自动提权并打开浏览器）。
 
 ---
@@ -169,6 +170,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
 | GET  | `/api/physical_disks` | 物理磁盘列表（`disk_number` / `model` / `size`） |
 | POST | `/api/raw_scan_all` | `{disk_number}` 遍历整盘、定位所有分区 → 各分区独立 task |
 | GET  | `/api/scans` | 已完成的扫描（含持久化缓存） |
+| GET  | `/api/active` | 进行中的扫描 / 恢复任务（刷新页面后恢复状态用） |
 | GET  | `/api/scan/{id}/status` | 扫描进度 |
 | GET  | `/api/scan/{id}/results` | 目录树（根节点 `/`） |
 | POST | `/api/scan/{id}/pause\|resume\|stop` | 暂停 / 继续 / 停止扫描 |

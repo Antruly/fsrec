@@ -104,6 +104,21 @@
   .disk-badge { display: inline-block; margin-top: 8px; font-size: 11.5px; padding: 2px 8px; border-radius: 20px; }
   .disk-badge.sys { background: var(--red-bg); color: var(--red); }
   .disk-badge.ok { background: var(--green-weak); color: var(--green); }
+  .disk-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .disk-live { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--muted); }
+  .disk-live .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--border); }
+  .disk-live.active .dot { background: #3fd278; }
+  .disk-live b { color: var(--text); font-weight: 700; }
+  .disk-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; }
+  .disk-expand { font-size: 11.5px; padding: 2px 9px; border-radius: 20px; border: 1px solid var(--border); background: transparent; color: var(--text); cursor: pointer; font-family: inherit; }
+  .disk-expand:hover { border-color: var(--primary); color: var(--primary); }
+  .disk-expand.open { border-color: var(--primary); color: var(--primary); background: var(--primary-weak); }
+  .disk-detail { grid-column: 1 / -1; border: 1.5px solid var(--border); background: var(--card); border-radius: 12px; padding: 14px 16px; }
+  .disk-detail-head { font-weight: 700; margin-bottom: 2px; }
+  .disk-detail-head .muted { font-weight: 400; font-size: 12px; }
+  .disk-detail-cur { font-size: 12.5px; color: var(--muted); margin-bottom: 10px; }
+  .disk-detail-cur b { color: var(--text); font-size: 18px; }
+  #diskChart { width: 100%; height: 150px; display: block; }
 
   /* ---- controls ---- */
   .form-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
@@ -211,6 +226,10 @@
   .conn .dot { width: 8px; height: 8px; border-radius: 50%; background: #f0a23c; }
   .conn.ok .dot { background: #3fd278; }
   .conn.bad .dot { background: #f0706a; }
+  .iostat { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: rgba(255,255,255,.85); background: rgba(255,255,255,.1); padding: 5px 10px; border-radius: 20px; }
+  .iostat .dot { width: 8px; height: 8px; border-radius: 50%; background: #f0a23c; }
+  .iostat.live .dot { background: #3fd278; }
+  .iostat b { font-weight: 700; color: #fff; }
   .topbtn { background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.2); color: #fff; padding: 6px 12px; border-radius: 10px; font-size: 13px; cursor: pointer; font-family: inherit; }
   .topbtn:hover { background: rgba(255,255,255,.22); }
 
@@ -275,6 +294,7 @@
       </div>
       <div class="topbar-right">
         <span class="conn" id="connStatus"><span class="dot"></span><span id="connText">连接中…</span></span>
+        <span class="iostat" id="ioStat" title="磁盘实时读取速度（WebSocket 实时推送）"><span class="dot"></span>💾 <b id="ioMbps">0.0</b> MB/s</span>
         <a class="gh-btn" href="https://github.com/Antruly/fsrec" target="_blank" rel="noopener" title="GitHub 仓库"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg></a>
         <button id="helpBtn" class="topbtn">❓ 帮助</button>
         <button id="aboutBtn" class="topbtn">ℹ️ 关于</button>
@@ -491,6 +511,10 @@ let currentJobId = null;
 let currentScanTaskId = null;
 let ws = null;
 let pickPath = '';   // current directory in the picker
+let diskSpeed = {};   // disk_number -> latest read MB/s (from WS sys push)
+let diskHistory = {}; // disk_number -> [{t, mbps}] rolling window for the chart
+let expandedDisk = null; // disk number whose real-time chart is open
+let scanDiskNumber = null; // disk currently being scanned (for hot-unplug prompt)
 
 const $ = (id) => document.getElementById(id);
 
@@ -534,32 +558,198 @@ async function apiPost(path, body) {
 async function loadDisks() {
   try {
     diskList = await apiGet('/api/physical_disks');
-    const grid = $('diskGrid');
-    grid.innerHTML = '';
-    for (const d of diskList) {
-      const isSys = d.disk_number === 0;
-      const card = document.createElement('button');
-      card.type = 'button';
-      card.className = 'disk-card' + (isSys ? ' disabled' : '');
-      card.disabled = isSys;
-      card.innerHTML =
-        `<div class="disk-num">磁盘 ${d.disk_number}</div>` +
-        `<div class="disk-model">${esc(d.model || '未知设备')}</div>` +
-        `<div class="disk-size">${fmtBytes(d.size)}</div>` +
-        (isSys ? '<div class="disk-badge sys">⛔ 系统盘 · 禁止</div>' : '<div class="disk-badge ok">可安全选择</div>');
+    renderDisks();
+  } catch (e) {
+    $('diskGrid').innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>';
+  }
+}
+
+function renderDisks() {
+  const grid = $('diskGrid');
+  grid.innerHTML = '';
+  for (const d of diskList) {
+    const isSys = d.disk_number === 0;
+    const card = document.createElement('div');
+    card.className = 'disk-card' + (isSys ? ' disabled' : '');
+    card.setAttribute('data-d', d.disk_number);
+    if (!isSys) { card.tabIndex = 0; card.setAttribute('role', 'button'); }
+    card.innerHTML =
+      `<div class="disk-top"><div class="disk-num">磁盘 ${d.disk_number}</div>` +
+      `<span class="disk-live" id="live-${d.disk_number}"><span class="dot"></span><b>0.0</b> MB/s</span></div>` +
+      `<div class="disk-model">${esc(d.model || '未知设备')}</div>` +
+      `<div class="disk-size">${fmtBytes(d.size)}</div>` +
+      `<div class="disk-foot">` +
+        (isSys ? '<div class="disk-badge sys">⛔ 系统盘 · 禁止</div>' : '<div class="disk-badge ok">可安全选择</div>') +
+        `<button class="disk-expand" data-d="${d.disk_number}" title="展开实时读取折线图">📈 实时</button>` +
+      `</div>`;
+    if (!isSys) {
       card.addEventListener('click', () => {
-        if (isSys) return;
         selectedDiskNumber = d.disk_number;
         grid.querySelectorAll('.disk-card').forEach(c => c.classList.remove('selected'));
         card.classList.add('selected');
         toggleScanEnabled();
       });
-      grid.appendChild(card);
+      card.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); card.click(); }
+      });
     }
-    if (!diskList.length) grid.innerHTML = '<div class="empty">未检测到物理磁盘（请以管理员身份运行）</div>';
-  } catch (e) {
-    $('diskGrid').innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>';
+    grid.appendChild(card);
   }
+  if (!diskList.length) grid.innerHTML = '<div class="empty">未检测到物理磁盘（请以管理员身份运行）</div>';
+
+  grid.querySelectorAll('.disk-expand').forEach(btn => {
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      toggleDiskDetail(Number(btn.getAttribute('data-d')));
+    });
+  });
+
+  // Re-apply selection / expansion / live readings that survived a re-render.
+  if (selectedDiskNumber != null) {
+    const sel = grid.querySelector(`.disk-card[data-d="${selectedDiskNumber}"]`);
+    if (sel) sel.classList.add('selected'); else selectedDiskNumber = null;
+  }
+  for (const n in diskSpeed) updateDiskLive(Number(n));
+  if (expandedDisk != null && diskList.some(d => d.disk_number === expandedDisk)) {
+    buildDiskDetail(expandedDisk);
+  } else {
+    expandedDisk = null;
+  }
+}
+
+// Update the small inline read-speed badge on a disk card.
+function updateDiskLive(n) {
+  const el = document.getElementById('live-' + n);
+  if (!el) return;
+  const mbps = diskSpeed[n] || 0;
+  el.querySelector('b').textContent = mbps.toFixed(1);
+  el.classList.toggle('active', mbps > 0.05);
+}
+
+// ---------------------------------------------------------------------------
+// Per-disk real-time chart (Task-Manager style)
+// ---------------------------------------------------------------------------
+function toggleDiskDetail(n) {
+  if (expandedDisk === n) { expandedDisk = null; removeDiskDetail(); return; }
+  expandedDisk = n;
+  buildDiskDetail(n);
+}
+
+function removeDiskDetail() {
+  const p = document.getElementById('diskDetail');
+  if (p) p.remove();
+  document.querySelectorAll('.disk-expand').forEach(b => b.classList.remove('open'));
+}
+
+function buildDiskDetail(n) {
+  removeDiskDetail();
+  const card = document.querySelector(`.disk-card[data-d="${n}"]`);
+  if (!card) { expandedDisk = null; return; }
+  const d = diskList.find(x => x.disk_number === n);
+  const panel = document.createElement('div');
+  panel.id = 'diskDetail';
+  panel.className = 'disk-detail';
+  const h = diskHistory[n] || [];
+  const peak = h.length ? Math.max(1, ...h.map(p => p.mbps)) : 1;
+  panel.innerHTML =
+    `<div class="disk-detail-head">📈 磁盘 ${n} 实时读取速度` +
+      (d ? ` <span class="muted">${esc(d.model || '')} · ${fmtBytes(d.size)}</span>` : '') +
+    `</div>` +
+    `<div class="disk-detail-cur">当前 <b id="detailMbps">${(diskSpeed[n] || 0).toFixed(1)}</b> MB/s` +
+      ` · 峰值 <span id="detailPeak">${peak.toFixed(1)}</span> MB/s</div>` +
+    `<canvas id="diskChart"></canvas>`;
+  card.insertAdjacentElement('afterend', panel);
+  const btn = card.querySelector('.disk-expand');
+  if (btn) btn.classList.add('open');
+  drawDiskChart(n);
+}
+
+function drawDiskChart(n) {
+  const cv = document.getElementById('diskChart');
+  if (!cv) return;
+  const hist = diskHistory[n] || [];
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth || 600, H = cv.clientHeight || 150;
+  cv.width = Math.max(1, Math.floor(W * dpr));
+  cv.height = Math.max(1, Math.floor(H * dpr));
+  const ctx = cv.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+
+  const padL = 44, padR = 12, padT = 10, padB = 20;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const maxV = Math.max(1, ...hist.map(p => p.mbps)) * 1.15;
+  const N = 60;
+
+  // Grid + y-axis labels.
+  ctx.font = '10px system-ui, sans-serif';
+  ctx.strokeStyle = 'rgba(128,128,128,.18)';
+  ctx.fillStyle = 'var(--muted)';
+  const ticks = 4;
+  for (let i = 0; i <= ticks; i++) {
+    const v = maxV * i / ticks;
+    const y = padT + plotH - (plotH * i / ticks);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + plotW, y); ctx.stroke();
+    ctx.fillText(v.toFixed(0), 4, y + 3);
+  }
+
+  // Line.
+  if (hist.length > 1) {
+    ctx.beginPath();
+    hist.forEach((p, i) => {
+      const x = padL + plotW * (i / (N - 1));
+      const y = padT + plotH - (Math.min(p.mbps, maxV) / maxV) * plotH;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = '#2f6bff';
+    ctx.lineWidth = 2;
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+    // Soft fill under the line.
+    ctx.lineTo(padL + plotW * ((hist.length - 1) / (N - 1)), padT + plotH);
+    ctx.lineTo(padL, padT + plotH);
+    ctx.closePath();
+    const g = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+    g.addColorStop(0, 'rgba(47,107,255,.28)');
+    g.addColorStop(1, 'rgba(47,107,255,0)');
+    ctx.fillStyle = g;
+    ctx.fill();
+  } else {
+    ctx.fillStyle = 'var(--muted)';
+    ctx.fillText('等待数据…', padL + 8, padT + plotH / 2);
+  }
+
+  // Time axis (last 60s → now).
+  ctx.fillStyle = 'var(--muted)';
+  ctx.fillText('-60s', padL, H - 4);
+  ctx.fillText('现在', padL + plotW - 24, H - 4);
+}
+
+// Handle a {type:"disks"} push: a physical disk was attached or removed.
+function handleDiskChange(list) {
+  const prevSet = new Set(diskList.map(d => d.disk_number));
+  const nextSet = new Set(list.map(d => d.disk_number));
+  for (const n of prevSet) {
+    if (nextSet.has(n)) continue;
+    // Removed. Prompt if it was the disk under scan or the source of results.
+    if (scanDiskNumber === n && currentScanTaskId) {
+      $('stats').innerHTML = `<span style="color:var(--red)">⚠ 磁盘 ${n} 已被移除，扫描任务已中断</span>`;
+      setScanControls('done');
+      currentScanTaskId = null;
+      scanDiskNumber = null;
+      toggleScanEnabled();
+    }
+    if (currentDiskNumber === n) {
+      $('stats').innerHTML = `<span style="color:var(--red)">⚠ 磁盘 ${n} 已被移除</span>`;
+    }
+    if (selectedDiskNumber === n) selectedDiskNumber = null;
+    if (expandedDisk === n) expandedDisk = null;
+    delete diskSpeed[n];
+    delete diskHistory[n];
+  }
+  diskList = list;
+  renderDisks();
+  toggleScanEnabled();
 }
 
 async function loadSavedScans() {
@@ -670,6 +860,7 @@ async function onScan() {
   try {
     const j = await apiPost('/api/raw_scan_all', { disk_number: selectedDiskNumber });
     currentScanTaskId = j.task_id;
+    scanDiskNumber = selectedDiskNumber;
     setScanControls('running');
     // Live progress arrives over WebSocket; fall back to polling only if the
     // socket is down so the UI is never silently stuck at 0%.
@@ -736,6 +927,7 @@ function applyScanState(s) {
 
 async function finishScan(s) {
   currentScanTaskId = null;
+  scanDiskNumber = null;
   setScanControls('done');
   if (s.status === 'completed') {
     $('bar').style.width = '100%';
@@ -764,6 +956,45 @@ function pollScanAll(taskId) {
       applyScanState(s);
     }
   }, 1000);
+}
+
+function pollRecoverAll(jobId) {
+  const t = setInterval(async () => {
+    let s;
+    try { s = await apiGet(`/api/recover/${jobId}/status`); }
+    catch (e) { clearInterval(t); $('rstats').textContent = '状态查询失败：' + e.message; currentJobId = null; setRecoverControls('done'); return; }
+    applyRecoverState(s);
+    if (s.status === 'completed' || s.status === 'failed' || s.status === 'stopped') {
+      clearInterval(t);
+      currentJobId = null;
+    }
+  }, 1000);
+}
+
+// Restore any in-flight scan/recover after a page refresh, so the UI keeps
+// showing live progress and the pause/stop buttons keep working even though the
+// browser reloaded (the backend task keeps running server-side).
+async function restoreActive() {
+  let a;
+  try { a = await apiGet('/api/active'); } catch (e) { return; }
+  if (!a) return;
+  if (a.scan) {
+    currentScanTaskId = a.scan.task_id;
+    scanDiskNumber = a.scan.disk_number != null ? a.scan.disk_number : null;
+    $('progressWrap').style.display = '';
+    setStep(2);
+    setScanControls(a.scan.status === 'paused' ? 'paused' : 'running');
+    applyScanState(a.scan);
+    pollScanAll(a.scan.task_id); // poll fallback; WS also drives updates
+  }
+  if (a.recover) {
+    currentJobId = a.recover.job_id;
+    $('recoverWrap').style.display = '';
+    setStep(4);
+    setRecoverControls(a.recover.status === 'paused' ? 'paused' : 'running');
+    applyRecoverState(a.recover);
+    pollRecoverAll(a.recover.job_id);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,9 +1282,38 @@ function connectWS() {
   try {
     const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
     ws = new WebSocket(proto + location.host + '/ws');
+    ws.onopen = () => ioStatLive(true);
     ws.onmessage = (ev) => {
       let m;
       try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (m.type === 'sys') {
+        ioStatLive(true);
+        $('ioMbps').textContent = (Number(m.read_mbps) || 0).toFixed(1);
+        // Per-disk read speeds → inline badges + chart history.
+        const disks = m.disks || {};
+        for (const k in disks) {
+          const n = Number(k);
+          diskSpeed[n] = Number(disks[k]) || 0;
+          if (!diskHistory[n]) diskHistory[n] = [];
+          const hist = diskHistory[n];
+          hist.push({ t: Date.now(), mbps: diskSpeed[n] });
+          if (hist.length > 60) hist.shift();
+          updateDiskLive(n);
+        }
+        if (expandedDisk != null) {
+          const cur = document.getElementById('detailMbps');
+          if (cur) cur.textContent = (diskSpeed[expandedDisk] || 0).toFixed(1);
+          const h = diskHistory[expandedDisk] || [];
+          const peak = document.getElementById('detailPeak');
+          if (peak) peak.textContent = (h.length ? Math.max(...h.map(p => p.mbps)) : 0).toFixed(1);
+          drawDiskChart(expandedDisk);
+        }
+        return;
+      }
+      if (m.type === 'disks') {
+        handleDiskChange(m.disks || []);
+        return;
+      }
       if (m.job_id) {
         if (m.job_id === currentJobId) applyRecoverState(m);
         return;
@@ -1063,9 +1323,14 @@ function connectWS() {
         return;
       }
     };
-    ws.onclose = () => setTimeout(connectWS, 2000);
+    ws.onclose = () => { ioStatLive(false); setTimeout(connectWS, 2000); };
     ws.onerror = () => { try { ws.close(); } catch (e) {} };
-  } catch (e) { setTimeout(connectWS, 3000); }
+  } catch (e) { ioStatLive(false); setTimeout(connectWS, 3000); }
+}
+
+function ioStatLive(ok) {
+  const el = $('ioStat');
+  if (el) el.classList.toggle('live', ok);
 }
 
 function setRecoverControls(state) {
@@ -1143,6 +1408,9 @@ async function onRecover() {
     currentJobId = j.job_id;
     // Pull once so the UI reflects state immediately even before the first WS frame.
     try { applyRecoverState(await apiGet(`/api/recover/${j.job_id}/status`)); } catch (e) {}
+    // Fall back to polling if the WebSocket isn't up, so recover progress is
+    // never silently stuck at 0%.
+    if (!ws || ws.readyState !== WebSocket.OPEN) pollRecoverAll(j.job_id);
   } catch (e) {
     $('rstats').textContent = '启动恢复失败：' + e.message;
     setRecoverControls('done');
@@ -1297,6 +1565,7 @@ heartbeat();
 connectWS();
 loadDisks();
 loadSavedScans();
+restoreActive();
 </script>
 </body>
 </html>
