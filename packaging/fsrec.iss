@@ -2,7 +2,7 @@
 ; 编译：ISCC.exe packaging\fsrec.iss   （或运行 scripts\build_release.ps1）
 
 #define MyAppName "fsrec"
-#define MyAppVersion "1.0.1"
+#define MyAppVersion "1.0.2"
 #define MyAppPublisher "fsrec"
 #define MyAppExeName "recovery_server.exe"
 
@@ -42,18 +42,19 @@ Source: "..\build\Release\libssl-3-x64.dll";  DestDir: "{app}"; Flags: ignorever
 Source: "..\build\Release\libcrypto-3-x64.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\frontend\dist\*"; DestDir: "{app}\frontend\dist"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\docs\*";          DestDir: "{app}\docs";          Flags: ignoreversion recursesubdirs
-Source: "..\启动fsrec.bat";   DestDir: "{app}"; Flags: ignoreversion
-Source: "..\停止fsrec.bat";   DestDir: "{app}"; Flags: ignoreversion
+Source: "..\start.bat";   DestDir: "{app}"; Flags: ignoreversion
+Source: "..\stop.bat";   DestDir: "{app}"; Flags: ignoreversion
+Source: "..\resources\fsrec.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\vc++\vcredist_vs2022_x64.exe"; DestDir: "{app}\vc++"; Flags: ignoreversion
 
 [Dirs]
 Name: "{app}\data"
 
 [Icons]
-Name: "{group}\fsrec"; Filename: "{app}\启动fsrec.bat"; WorkingDir: "{app}"
+Name: "{group}\fsrec"; Filename: "{app}\start.bat"; WorkingDir: "{app}"; IconFilename: "{app}\fsrec.ico"
 Name: "{group}\fsrec 使用说明"; Filename: "notepad.exe"; Parameters: """{app}\docs\使用说明.md"""
-Name: "{group}\停止 fsrec"; Filename: "{app}\停止fsrec.bat"; WorkingDir: "{app}"
-Name: "{autodesktop}\fsrec"; Filename: "{app}\启动fsrec.bat"; Tasks: desktopicon; WorkingDir: "{app}"
+Name: "{group}\停止 fsrec"; Filename: "{app}\stop.bat"; WorkingDir: "{app}"; IconFilename: "{app}\fsrec.ico"
+Name: "{autodesktop}\fsrec"; Filename: "{app}\start.bat"; Tasks: desktopicon; WorkingDir: "{app}"; IconFilename: "{app}\fsrec.ico"
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--port {code:GetPort}"; Description: "立即启动 fsrec"; Flags: postinstall nowait skipifsilent

@@ -40,6 +40,12 @@ public:
         shutdown_cb_ = std::move(cb);
     }
 
+    // Wake the event loop from another thread (uv_async_send). The shutdown
+    // path calls this after stop_loop(): uv_stop() only sets a flag and does
+    // NOT wake a loop blocked in GetQueuedCompletionStatus, so without this the
+    // process never leaves uv_run() and the console window stays open.
+    void wake();
+
 private:
     void handle_request(uvcpp::uvcpp_http_request& req,
                         uvcpp::uvcpp_http_response& resp,

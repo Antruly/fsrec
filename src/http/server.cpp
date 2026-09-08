@@ -331,6 +331,13 @@ void HttpApi::flush_pending(uvcpp::uvcpp_async*) {
     for (const auto& m : pending) broadcast(m);
 }
 
+// Wake the loop from another thread. uv_stop() (via stop_loop) only sets
+// stop_flag and does NOT wake a loop blocked in GetQueuedCompletionStatus, so
+// the shutdown path calls this to unblock uv_run() so it can observe the flag.
+void HttpApi::wake() {
+    if (hub_ && hub_->async) hub_->async->send();
+}
+
 void HttpApi::on_ws_command(uvcpp::uvcpp_ws_connection* conn,
                             const std::string& msg) {
     (void)conn;

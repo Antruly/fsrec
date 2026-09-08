@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <string>
 
 #include <windows.h>
@@ -26,6 +27,7 @@ static recovery::Scanner*   g_scanner  = nullptr;
 static recovery::Restorer*  g_restorer = nullptr;
 static uvcpp::uvcpp_http_server* g_server = nullptr;
 static std::atomic<bool> g_shutting_down{false};
+static std::function<void()> g_wake_loop;  // pokes the libuv loop (uv_async_send)
 
 // Handle Ctrl+C, window close (X), logoff and shutdown. We take over the close
 // so the process can stop its worker threads and the event loop gracefully,
@@ -42,6 +44,7 @@ BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
             if (g_scanner)  g_scanner->shutdown();
             if (g_restorer) g_restorer->shutdown();
             if (g_server)   g_server->get_tcp_server()->stop_loop();
+            if (g_wake_loop) g_wake_loop(); // unblock uv_run so the process exits
         }
         return TRUE; // handled — prevent the default terminate
     default:
@@ -105,6 +108,12 @@ bool is_admin() {
 } // namespace
 
 int main(int argc, char** argv) {
+    // Print UTF-8 text (e.g. the Chinese status messages below) correctly on a
+    // GBK (codepage 936) console: tell the console to interpret our output
+    // bytes as UTF-8 instead of mangling them.
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+
     // Optional CLI flags: --port <n> (default 8080), --no-browser (don't
     // auto-open the web UI in the default browser on startup).
     int port = 8080;
@@ -165,6 +174,7 @@ int main(int argc, char** argv) {
     g_scanner = &scanner;
     g_restorer = &restorer;
     g_server = &server;
+    g_wake_loop = [&api]() { api.wake(); };
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
     api.set_shutdown_callback([&]() {
         if (!g_shutting_down.exchange(true)) {
@@ -172,6 +182,7 @@ int main(int argc, char** argv) {
             scanner.shutdown();
             restorer.shutdown();
             server.get_tcp_server()->stop_loop();
+            api.wake(); // unblock uv_run so the process exits and closes the console
         }
     });
 

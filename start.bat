@@ -26,5 +26,5 @@ if not errorlevel 1 (
 )
 
 echo 正在启动 fsrec (端口 %PORT%,请在 UAC 提示中点击"是"以授予管理员权限)...
-start "" "%~dp0recovery_server.exe" --port %PORT%
+start "" "%~dp0recovery_server.exe"
 exit /b 0

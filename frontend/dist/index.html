@@ -240,6 +240,24 @@
   .help-body code { background: var(--bg); border: 1px solid var(--border); padding: 1px 6px; border-radius: 6px; font-size: 12.5px; }
   .help-body .warn { color: var(--red); }
 
+  /* ---- about modal + github ---- */
+  .about-body { overflow: auto; padding: 26px 24px 28px; text-align: center; font-size: 13.5px; line-height: 1.65; }
+  .about-logo { width: 66px; height: 66px; margin: 0 auto 14px; border-radius: 18px; background: linear-gradient(135deg, #1a2747 0%, #2f6bff 100%); display: flex; align-items: center; justify-content: center; font-size: 30px; box-shadow: 0 10px 24px rgba(47,107,255,.3); }
+  .about-title { margin: 0; font-size: 22px; font-weight: 700; letter-spacing: .3px; display: flex; align-items: center; justify-content: center; gap: 8px; }
+  .about-title .ver { color: var(--text); background: var(--primary-weak); }
+  .about-tagline { margin: 4px 0 12px; color: var(--muted); font-size: 13px; }
+  .about-desc { margin: 0 auto 18px; max-width: 470px; text-align: left; }
+  .about-stack { display: flex; flex-wrap: wrap; gap: 7px; justify-content: center; margin-bottom: 22px; }
+  .chip { font-size: 12px; padding: 4px 11px; border-radius: 20px; background: var(--primary-weak); color: var(--primary); text-decoration: none; }
+  a.chip:hover { text-decoration: underline; }
+  .about-gh { display: inline-flex; align-items: center; gap: 8px; padding: 11px 20px; border-radius: 12px; background: #24292f; color: #fff; text-decoration: none; font-weight: 600; font-size: 14px; transition: transform .12s, box-shadow .12s; box-shadow: 0 4px 14px rgba(0,0,0,.25); }
+  .about-gh:hover { transform: translateY(-1px); box-shadow: 0 8px 20px rgba(0,0,0,.32); }
+  .about-gh svg { width: 18px; height: 18px; fill: #fff; }
+  .about-meta { margin-top: 18px; color: var(--muted); font-size: 12px; }
+  .gh-btn { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: 10px; background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.2); color: #fff; cursor: pointer; }
+  .gh-btn:hover { background: rgba(255,255,255,.22); }
+  .gh-btn svg { width: 17px; height: 17px; fill: #fff; }
+
   @media (max-width: 640px) {
     .container { padding: 12px; }
     .card { padding: 16px; }
@@ -252,11 +270,12 @@
     <div class="topbar-inner">
       <div class="logo">🛠️</div>
       <div class="brand">
-        <h1>fsrec <span class="ver">v1.0.1</span></h1>
+        <h1>fsrec <span class="ver">v1.0.2</span></h1>
         <p class="sub">NTFS 数据恢复 · 误格式化 / 覆盖的硬盘 · 只读扫描定位 → 手动确认恢复</p>
       </div>
       <div class="topbar-right">
         <span class="conn" id="connStatus"><span class="dot"></span><span id="connText">连接中…</span></span>
+        <a class="gh-btn" href="https://github.com/Antruly/fsrec" target="_blank" rel="noopener" title="GitHub 仓库"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg></a>
         <button id="helpBtn" class="topbtn">❓ 帮助</button>
         <button id="aboutBtn" class="topbtn">ℹ️ 关于</button>
         <button id="disclaimerBtn" class="topbtn">🛡️ 免责声明</button>
@@ -370,7 +389,7 @@
 
   <footer class="footer">
     <div class="footer-inner">
-      <span>fsrec v1.0.1 · NTFS 数据恢复工具</span>
+      <span>fsrec v1.0.2 · NTFS 数据恢复工具</span>
       <span class="footer-sep">·</span>
       <span>扫描阶段只读，绝不写入源盘；恢复需手动确认</span>
       <span class="footer-sep">·</span>
@@ -423,16 +442,24 @@
   <!-- 关于 -->
   <div class="modal" id="aboutModal" style="display:none">
     <div class="modal-box">
-      <div class="modal-head">关于 <button class="modal-x" id="closeAbout">✕</button></div>
-      <div class="help-body">
-        <h3>fsrec v1.0.1</h3>
-        <p>一款 NTFS 数据恢复工具：通过 Windows 原始磁盘读取接口解析 NTFS 文件系统，
-        重建目录树，帮助你在硬盘被误格式化、分区被覆盖或文件被删除后，浏览并恢复文件与目录结构。</p>
-        <h3>技术栈</h3>
-        <p>C++17 · libuvcpp（HTTP/WebSocket）· nlohmann/json · Windows 原始磁盘读取接口</p>
-        <h3>开源地址</h3>
-        <p><a href="https://github.com/Antruly/fsrec" target="_blank" rel="noopener">https://github.com/Antruly/fsrec</a></p>
-        <p class="muted">MIT 开源许可证</p>
+      <div class="modal-head">关于 fsrec <button class="modal-x" id="closeAbout">✕</button></div>
+      <div class="about-body">
+        <div class="about-logo">🛠️</div>
+        <h2 class="about-title">fsrec <span class="ver">v1.0.2</span></h2>
+        <p class="about-tagline">NTFS 数据恢复工具</p>
+        <p class="about-desc">通过 Windows 原始磁盘读取接口解析 NTFS 文件系统、重建目录树，帮助你在硬盘被误格式化、分区被覆盖或文件被删除后，浏览并恢复文件与目录结构。</p>
+        <div class="about-stack">
+          <span class="chip">C++17</span>
+          <a class="chip" href="https://github.com/Antruly/libuvcpp" target="_blank" rel="noopener">libuvcpp ↗</a>
+          <span class="chip">WebSocket</span>
+          <span class="chip">nlohmann/json</span>
+          <span class="chip">NTFS</span>
+        </div>
+        <a class="about-gh" href="https://github.com/Antruly/fsrec" target="_blank" rel="noopener">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+          <span>GitHub 仓库</span>
+        </a>
+        <p class="about-meta">MIT 开源许可证 · © 2026 fsrec · 基于 <a href="https://github.com/Antruly/libuvcpp" target="_blank" rel="noopener">libuvcpp</a></p>
       </div>
     </div>
   </div>

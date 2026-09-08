@@ -65,9 +65,10 @@ target_link_libraries(recovery_server PRIVATE
 )
 
 # Mark the executable as requiring elevation (double-clicking triggers UAC).
-# We embed our own manifest (resources/fsrec.manifest) via the .rc, so we turn
-# off the linker's auto-generated manifest to avoid a duplicate.
-target_link_options(recovery_server PRIVATE "/MANIFEST:NO")
+# The linker auto-generates and embeds a requireAdministrator manifest — the
+# same approach HBOP uses, verified to trigger UAC reliably. (A hand-embedded
+# .rc manifest turned out not to trigger UAC, so we use the linker flag.)
+target_link_options(recovery_server PRIVATE "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'")
 
 # ---------------------------------------------------------------------------
 # Copy runtime DLLs next to the executable.
