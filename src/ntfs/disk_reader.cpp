@@ -12,16 +12,8 @@ namespace recovery {
 // Process-wide raw-read byte counter (see total_bytes_read() in the header).
 static std::atomic<uint64_t> g_total_bytes_read{0};
 
-// Per-disk raw-read byte counters, indexed by PhysicalDriveN number.
-static std::atomic<uint64_t> g_disk_bytes[32]{};
-
 uint64_t total_bytes_read() {
     return g_total_bytes_read.load(std::memory_order_relaxed);
-}
-
-uint64_t disk_bytes_read(int disk_number) {
-    if (disk_number < 0 || disk_number >= 32) return 0;
-    return g_disk_bytes[disk_number].load(std::memory_order_relaxed);
 }
 
 DiskReader::~DiskReader() {
@@ -35,7 +27,6 @@ void DiskReader::close() {
     }
     base_offset_ = 0;
     physical_size_ = 0;
-    disk_number_ = -1;
 }
 
 bool DiskReader::open(const std::string& drive, std::string* error) {

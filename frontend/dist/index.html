@@ -113,6 +113,11 @@
   .disk-expand { font-size: 11.5px; padding: 2px 9px; border-radius: 20px; border: 1px solid var(--border); background: transparent; color: var(--text); cursor: pointer; font-family: inherit; }
   .disk-expand:hover { border-color: var(--primary); color: var(--primary); }
   .disk-expand.open { border-color: var(--primary); color: var(--primary); background: var(--primary-weak); }
+  .disk-io { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; font-size: 11.5px; color: var(--muted); }
+  .disk-io .rw b { color: var(--text); font-weight: 700; }
+  .disk-io .u b { color: var(--text); font-weight: 700; }
+  .util-bar { height: 4px; background: var(--border); border-radius: 20px; overflow: hidden; margin-top: 6px; }
+  .util-fill { display: block; height: 100%; width: 0%; background: linear-gradient(90deg, #2f6bff, #3fd278); transition: width .4s; }
   .disk-detail { grid-column: 1 / -1; border: 1.5px solid var(--border); background: var(--card); border-radius: 12px; padding: 14px 16px; }
   .disk-detail-head { font-weight: 700; margin-bottom: 2px; }
   .disk-detail-head .muted { font-weight: 400; font-size: 12px; }
@@ -289,7 +294,7 @@
     <div class="topbar-inner">
       <div class="logo">🛠️</div>
       <div class="brand">
-        <h1>fsrec <span class="ver">v1.0.2</span></h1>
+        <h1>fsrec <span class="ver">v1.0.3</span></h1>
         <p class="sub">NTFS 数据恢复 · 误格式化 / 覆盖的硬盘 · 只读扫描定位 → 手动确认恢复</p>
       </div>
       <div class="topbar-right">
@@ -409,7 +414,7 @@
 
   <footer class="footer">
     <div class="footer-inner">
-      <span>fsrec v1.0.2 · NTFS 数据恢复工具</span>
+      <span>fsrec <span class="ver">v1.0.3</span> · NTFS 数据恢复工具</span>
       <span class="footer-sep">·</span>
       <span>扫描阶段只读，绝不写入源盘；恢复需手动确认</span>
       <span class="footer-sep">·</span>
@@ -465,7 +470,7 @@
       <div class="modal-head">关于 fsrec <button class="modal-x" id="closeAbout">✕</button></div>
       <div class="about-body">
         <div class="about-logo">🛠️</div>
-        <h2 class="about-title">fsrec <span class="ver">v1.0.2</span></h2>
+        <h2 class="about-title">fsrec <span class="ver">v1.0.3</span></h2>
         <p class="about-tagline">NTFS 数据恢复工具</p>
         <p class="about-desc">通过 Windows 原始磁盘读取接口解析 NTFS 文件系统、重建目录树，帮助你在硬盘被误格式化、分区被覆盖或文件被删除后，浏览并恢复文件与目录结构。</p>
         <div class="about-stack">
@@ -511,8 +516,8 @@ let currentJobId = null;
 let currentScanTaskId = null;
 let ws = null;
 let pickPath = '';   // current directory in the picker
-let diskSpeed = {};   // disk_number -> latest read MB/s (from WS sys push)
-let diskHistory = {}; // disk_number -> [{t, mbps}] rolling window for the chart
+let diskStat = {};    // disk_number -> {r, w, u} read/write MB/s + util % (from WS sys push)
+let diskHistory = {}; // disk_number -> [{t, r, w, u}] rolling window for the chart
 let expandedDisk = null; // disk number whose real-time chart is open
 let scanDiskNumber = null; // disk currently being scanned (for hot-unplug prompt)
 
@@ -575,12 +580,17 @@ function renderDisks() {
     if (!isSys) { card.tabIndex = 0; card.setAttribute('role', 'button'); }
     card.innerHTML =
       `<div class="disk-top"><div class="disk-num">磁盘 ${d.disk_number}</div>` +
-      `<span class="disk-live" id="live-${d.disk_number}"><span class="dot"></span><b>0.0</b> MB/s</span></div>` +
+      `<span class="disk-live" id="live-${d.disk_number}"><span class="dot"></span></span></div>` +
       `<div class="disk-model">${esc(d.model || '未知设备')}</div>` +
       `<div class="disk-size">${fmtBytes(d.size)}</div>` +
+      `<div class="disk-io">` +
+        `<span class="rw">⤓ <b id="rd-${d.disk_number}">0.0</b> / ⤒ <b id="wr-${d.disk_number}">0.0</b> MB/s</span>` +
+        `<span class="u">负载 <b id="ut-${d.disk_number}">0</b>%</span>` +
+      `</div>` +
+      `<div class="util-bar"><span class="util-fill" id="uf-${d.disk_number}"></span></div>` +
       `<div class="disk-foot">` +
         (isSys ? '<div class="disk-badge sys">⛔ 系统盘 · 禁止</div>' : '<div class="disk-badge ok">可安全选择</div>') +
-        `<button class="disk-expand" data-d="${d.disk_number}" title="展开实时读取折线图">📈 实时</button>` +
+        `<button class="disk-expand" data-d="${d.disk_number}" title="展开实时读写折线图">📈 实时</button>` +
       `</div>`;
     if (!isSys) {
       card.addEventListener('click', () => {
@@ -609,7 +619,7 @@ function renderDisks() {
     const sel = grid.querySelector(`.disk-card[data-d="${selectedDiskNumber}"]`);
     if (sel) sel.classList.add('selected'); else selectedDiskNumber = null;
   }
-  for (const n in diskSpeed) updateDiskLive(Number(n));
+  for (const n in diskStat) updateDiskLive(Number(n));
   if (expandedDisk != null && diskList.some(d => d.disk_number === expandedDisk)) {
     buildDiskDetail(expandedDisk);
   } else {
@@ -617,13 +627,19 @@ function renderDisks() {
   }
 }
 
-// Update the small inline read-speed badge on a disk card.
+// Update the small inline read/write + util badge on a disk card.
 function updateDiskLive(n) {
-  const el = document.getElementById('live-' + n);
-  if (!el) return;
-  const mbps = diskSpeed[n] || 0;
-  el.querySelector('b').textContent = mbps.toFixed(1);
-  el.classList.toggle('active', mbps > 0.05);
+  const st = diskStat[n] || { r: 0, w: 0, u: 0 };
+  const rd = document.getElementById('rd-' + n);
+  const wr = document.getElementById('wr-' + n);
+  const ut = document.getElementById('ut-' + n);
+  const uf = document.getElementById('uf-' + n);
+  const live = document.getElementById('live-' + n);
+  if (rd) rd.textContent = (st.r || 0).toFixed(1);
+  if (wr) wr.textContent = (st.w || 0).toFixed(1);
+  if (ut) ut.textContent = Math.round(st.u || 0);
+  if (uf) uf.style.width = Math.min(100, Math.round(st.u || 0)) + '%';
+  if (live) live.classList.toggle('active', (st.r || 0) + (st.w || 0) > 0.05);
 }
 
 // ---------------------------------------------------------------------------
@@ -646,17 +662,23 @@ function buildDiskDetail(n) {
   const card = document.querySelector(`.disk-card[data-d="${n}"]`);
   if (!card) { expandedDisk = null; return; }
   const d = diskList.find(x => x.disk_number === n);
+  const st = diskStat[n] || { r: 0, w: 0, u: 0 };
+  const h = diskHistory[n] || [];
+  const peakR = h.length ? Math.max(...h.map(p => p.r)) : 0;
+  const peakW = h.length ? Math.max(...h.map(p => p.w)) : 0;
   const panel = document.createElement('div');
   panel.id = 'diskDetail';
   panel.className = 'disk-detail';
-  const h = diskHistory[n] || [];
-  const peak = h.length ? Math.max(1, ...h.map(p => p.mbps)) : 1;
   panel.innerHTML =
-    `<div class="disk-detail-head">📈 磁盘 ${n} 实时读取速度` +
+    `<div class="disk-detail-head">📈 磁盘 ${n} 实时读写速度` +
       (d ? ` <span class="muted">${esc(d.model || '')} · ${fmtBytes(d.size)}</span>` : '') +
     `</div>` +
-    `<div class="disk-detail-cur">当前 <b id="detailMbps">${(diskSpeed[n] || 0).toFixed(1)}</b> MB/s` +
-      ` · 峰值 <span id="detailPeak">${peak.toFixed(1)}</span> MB/s</div>` +
+    `<div class="disk-detail-cur">` +
+      `⤓ 读 <b id="detailR" style="color:#2f6bff">${(st.r || 0).toFixed(1)}</b> MB/s · ` +
+      `⤒ 写 <b id="detailW" style="color:#ff9f2f">${(st.w || 0).toFixed(1)}</b> MB/s · ` +
+      `负载 <b id="detailU">${Math.round(st.u || 0)}</b>% · ` +
+      `峰值 <span id="detailPeak" class="muted">读 ${peakR.toFixed(1)} / 写 ${peakW.toFixed(1)}</span>` +
+    `</div>` +
     `<canvas id="diskChart"></canvas>`;
   card.insertAdjacentElement('afterend', panel);
   const btn = card.querySelector('.disk-expand');
@@ -676,15 +698,16 @@ function drawDiskChart(n) {
   ctx.scale(dpr, dpr);
   ctx.clearRect(0, 0, W, H);
 
-  const padL = 44, padR = 12, padT = 10, padB = 20;
+  const MUTED = '#8a94a6';
+  const padL = 44, padR = 12, padT = 14, padB = 22;
   const plotW = W - padL - padR, plotH = H - padT - padB;
-  const maxV = Math.max(1, ...hist.map(p => p.mbps)) * 1.15;
+  const maxV = Math.max(1, ...hist.map(p => Math.max(p.r, p.w))) * 1.15;
   const N = 60;
 
   // Grid + y-axis labels.
   ctx.font = '10px system-ui, sans-serif';
   ctx.strokeStyle = 'rgba(128,128,128,.18)';
-  ctx.fillStyle = 'var(--muted)';
+  ctx.fillStyle = MUTED;
   const ticks = 4;
   for (let i = 0; i <= ticks; i++) {
     const v = maxV * i / ticks;
@@ -693,34 +716,38 @@ function drawDiskChart(n) {
     ctx.fillText(v.toFixed(0), 4, y + 3);
   }
 
-  // Line.
   if (hist.length > 1) {
-    ctx.beginPath();
-    hist.forEach((p, i) => {
-      const x = padL + plotW * (i / (N - 1));
-      const y = padT + plotH - (Math.min(p.mbps, maxV) / maxV) * plotH;
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    });
-    ctx.strokeStyle = '#2f6bff';
-    ctx.lineWidth = 2;
-    ctx.lineJoin = 'round';
-    ctx.stroke();
-    // Soft fill under the line.
-    ctx.lineTo(padL + plotW * ((hist.length - 1) / (N - 1)), padT + plotH);
-    ctx.lineTo(padL, padT + plotH);
-    ctx.closePath();
-    const g = ctx.createLinearGradient(0, padT, 0, padT + plotH);
-    g.addColorStop(0, 'rgba(47,107,255,.28)');
-    g.addColorStop(1, 'rgba(47,107,255,0)');
-    ctx.fillStyle = g;
-    ctx.fill();
+    const drawLine = (key, color) => {
+      ctx.beginPath();
+      hist.forEach((p, i) => {
+        const x = padL + plotW * (i / (N - 1));
+        const y = padT + plotH - (Math.min(p[key], maxV) / maxV) * plotH;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.lineJoin = 'round';
+      ctx.stroke();
+    };
+    drawLine('r', '#2f6bff'); // 读（蓝）
+    drawLine('w', '#ff9f2f'); // 写（橙）
+
+    // Legend.
+    ctx.fillStyle = '#2f6bff';
+    ctx.fillRect(padL, padT - 10, 10, 3);
+    ctx.fillStyle = MUTED;
+    ctx.fillText('读', padL + 14, padT - 6);
+    ctx.fillStyle = '#ff9f2f';
+    ctx.fillRect(padL + 34, padT - 10, 10, 3);
+    ctx.fillStyle = MUTED;
+    ctx.fillText('写', padL + 48, padT - 6);
   } else {
-    ctx.fillStyle = 'var(--muted)';
+    ctx.fillStyle = MUTED;
     ctx.fillText('等待数据…', padL + 8, padT + plotH / 2);
   }
 
   // Time axis (last 60s → now).
-  ctx.fillStyle = 'var(--muted)';
+  ctx.fillStyle = MUTED;
   ctx.fillText('-60s', padL, H - 4);
   ctx.fillText('现在', padL + plotW - 24, H - 4);
 }
@@ -744,7 +771,7 @@ function handleDiskChange(list) {
     }
     if (selectedDiskNumber === n) selectedDiskNumber = null;
     if (expandedDisk === n) expandedDisk = null;
-    delete diskSpeed[n];
+    delete diskStat[n];
     delete diskHistory[n];
   }
   diskList = list;
@@ -1289,23 +1316,30 @@ function connectWS() {
       if (m.type === 'sys') {
         ioStatLive(true);
         $('ioMbps').textContent = (Number(m.read_mbps) || 0).toFixed(1);
-        // Per-disk read speeds → inline badges + chart history.
+        // Per-disk read/write + util → inline badges + chart history.
         const disks = m.disks || {};
         for (const k in disks) {
           const n = Number(k);
-          diskSpeed[n] = Number(disks[k]) || 0;
+          const d = disks[k] || {};
+          diskStat[n] = { r: Number(d.read_mbps) || 0, w: Number(d.write_mbps) || 0, u: Number(d.util) || 0 };
           if (!diskHistory[n]) diskHistory[n] = [];
           const hist = diskHistory[n];
-          hist.push({ t: Date.now(), mbps: diskSpeed[n] });
+          hist.push({ t: Date.now(), r: diskStat[n].r, w: diskStat[n].w, u: diskStat[n].u });
           if (hist.length > 60) hist.shift();
           updateDiskLive(n);
         }
         if (expandedDisk != null) {
-          const cur = document.getElementById('detailMbps');
-          if (cur) cur.textContent = (diskSpeed[expandedDisk] || 0).toFixed(1);
+          const st = diskStat[expandedDisk] || { r: 0, w: 0, u: 0 };
+          const dr = document.getElementById('detailR');
+          const dw = document.getElementById('detailW');
+          const du = document.getElementById('detailU');
+          if (dr) dr.textContent = (st.r || 0).toFixed(1);
+          if (dw) dw.textContent = (st.w || 0).toFixed(1);
+          if (du) du.textContent = Math.round(st.u || 0);
           const h = diskHistory[expandedDisk] || [];
           const peak = document.getElementById('detailPeak');
-          if (peak) peak.textContent = (h.length ? Math.max(...h.map(p => p.mbps)) : 0).toFixed(1);
+          if (peak) peak.textContent = h.length
+            ? `读 ${Math.max(...h.map(p => p.r)).toFixed(1)} / 写 ${Math.max(...h.map(p => p.w)).toFixed(1)}` : '';
           drawDiskChart(expandedDisk);
         }
         return;
@@ -1524,7 +1558,14 @@ function setConn(ok) {
   $('connText').textContent = ok ? '服务已连接' : '服务未连接';
 }
 async function heartbeat() {
-  try { const j = await apiGet('/ping'); setConn(j.status === 'ok'); }
+  try {
+    const j = await apiGet('/ping');
+    setConn(j.status === 'ok');
+    // Keep the version badge(s) in sync with the backend (single source of truth).
+    if (j.version) {
+      document.querySelectorAll('.ver').forEach(el => el.textContent = 'v' + j.version);
+    }
+  }
   catch (e) { setConn(false); }
 }
 setInterval(heartbeat, 5000);

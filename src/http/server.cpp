@@ -432,10 +432,16 @@ void HttpApi::setup(uvcpp::uvcpp_http_server& server,
         auto* stats_timer = new uvcpp::uvcpp_timer(server.get_tcp_server()->get_loop());
         stats_timer->start([this](uvcpp::uvcpp_timer*) {
             static uint64_t last_bytes = total_bytes_read();
-            static uint64_t last_disk[32] = {0};
             static std::set<int> last_disk_set;
             static int tick = 0;
             static auto last_t = std::chrono::steady_clock::now();
+
+            // Per-disk OS-level I/O counters (bytes read/written + busy time),
+            // sampled via IOCTL_DISK_PERFORMANCE so idle disks and writes from
+            // other processes are reflected too — like Task Manager.
+            struct Perf { int64_t r = 0, w = 0, busy = 0, q = 0; };
+            static Perf lastp[32];
+            static bool lastp_ok[32] = {false};
 
             uint64_t b = total_bytes_read();
             auto now = std::chrono::steady_clock::now();
@@ -457,13 +463,37 @@ void HttpApi::setup(uvcpp::uvcpp_http_server& server,
 
             json disks = json::object();
             for (int i = 0; i < 32; i++) {
-                uint64_t db = disk_bytes_read(i);
-                uint64_t prev = last_disk[i];
-                last_disk[i] = db;
-                double dmbps = dt > 0.0
-                    ? static_cast<double>(db - prev) / dt / (1024.0 * 1024.0)
-                    : 0.0;
-                if (db > 0 || prev > 0) disks[std::to_string(i)] = round1(dmbps);
+                char pbuf[64];
+                snprintf(pbuf, sizeof(pbuf), "\\\\.\\PhysicalDrive%d", i);
+                HANDLE h = CreateFileA(pbuf, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                       nullptr, OPEN_EXISTING, 0, nullptr);
+                if (h == INVALID_HANDLE_VALUE) continue;
+                DISK_PERFORMANCE p{};
+                DWORD used = 0;
+                if (DeviceIoControl(h, IOCTL_DISK_PERFORMANCE, nullptr, 0,
+                                    &p, sizeof(p), &used, nullptr)) {
+                    int64_t r = p.BytesRead.QuadPart;
+                    int64_t w = p.BytesWritten.QuadPart;
+                    int64_t busy = p.ReadTime.QuadPart + p.WriteTime.QuadPart;
+                    int64_t q = p.QueryTime.QuadPart;
+                    if (lastp_ok[i]) {
+                        double dts = static_cast<double>(q - lastp[i].q) / 1e7;
+                        if (dts > 0.0) {
+                            json d;
+                            d["read_mbps"]  = round1(static_cast<double>(r - lastp[i].r) / dts / 1e6);
+                            d["write_mbps"] = round1(static_cast<double>(w - lastp[i].w) / dts / 1e6);
+                            double util = static_cast<double>(busy - lastp[i].busy) /
+                                          static_cast<double>(q - lastp[i].q) * 100.0;
+                            if (util < 0.0) util = 0.0;
+                            if (util > 100.0) util = 100.0;
+                            d["util"] = round1(util);
+                            disks[std::to_string(i)] = std::move(d);
+                        }
+                    }
+                    lastp[i] = {r, w, busy, q};
+                    lastp_ok[i] = true;
+                }
+                CloseHandle(h);
             }
             j["disks"] = disks;
             broadcast(j.dump());
