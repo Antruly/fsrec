@@ -1,3 +1,4 @@
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -17,6 +18,36 @@
 #include "recovery/scanner.h"
 
 namespace {
+
+// Pointers used by the console control handler and the HTTP shutdown hook to
+// stop workers + the libuv loop from any thread. They are set once in main()
+// before any shutdown path can fire.
+static recovery::Scanner*   g_scanner  = nullptr;
+static recovery::Restorer*  g_restorer = nullptr;
+static uvcpp::uvcpp_http_server* g_server = nullptr;
+static std::atomic<bool> g_shutting_down{false};
+
+// Handle Ctrl+C, window close (X), logoff and shutdown. We take over the close
+// so the process can stop its worker threads and the event loop gracefully,
+// then let run() return normally — instead of the OS killing the process and
+// leaving it in a half-dead state that requires Task Manager.
+BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
+    switch (ctrl_type) {
+    case CTRL_C_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+    case CTRL_LOGOFF_EVENT:
+        if (!g_shutting_down.exchange(true)) {
+            std::fprintf(stderr, "[fsrec] 正在安全关闭服务，请稍候…\n");
+            if (g_scanner)  g_scanner->shutdown();
+            if (g_restorer) g_restorer->shutdown();
+            if (g_server)   g_server->get_tcp_server()->stop_loop();
+        }
+        return TRUE; // handled — prevent the default terminate
+    default:
+        return FALSE;
+    }
+}
 
 // Resolve the project root from the executable path. Supports two layouts:
 //   installed:  <app>\recovery_server.exe                (frontend is a sibling)
@@ -127,6 +158,22 @@ int main(int argc, char** argv) {
     uvcpp::uvcpp_ws_server ws;
     ws.attach(&server);
     api.setup(server, &static_svr, &ws);
+
+    // Wire graceful shutdown: the console close handler above, plus the HTTP
+    // "退出关闭服务" button (POST /api/shutdown). Both stop the workers and then
+    // the libuv loop so run() returns and the process exits cleanly.
+    g_scanner = &scanner;
+    g_restorer = &restorer;
+    g_server = &server;
+    SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
+    api.set_shutdown_callback([&]() {
+        if (!g_shutting_down.exchange(true)) {
+            std::fprintf(stderr, "[fsrec] 正在安全关闭服务…\n");
+            scanner.shutdown();
+            restorer.shutdown();
+            server.get_tcp_server()->stop_loop();
+        }
+    });
 
     const char* ip = "0.0.0.0";
     if (server.bind(ip, port) != 0) {

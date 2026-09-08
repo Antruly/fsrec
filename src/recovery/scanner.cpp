@@ -8,6 +8,9 @@
 #include <fstream>
 #include <functional>
 
+#include <windows.h>
+#include <winioctl.h>
+
 #include <nlohmann/json.hpp>
 
 #include "../include/util.h"
@@ -180,6 +183,34 @@ bool save_scan_file(const std::shared_ptr<ScanTask>& task, const std::string& da
 }
 
 
+
+// Read a physical disk's serial number (STORAGE_DEVICE_DESCRIPTOR /
+// SerialNumberOffset). Returns "" when unavailable (e.g. no access or no
+// vendor-supplied serial), in which case callers key by "disk<N>" instead.
+std::string read_disk_serial(int disk_number) {
+    char path[64];
+    snprintf(path, sizeof(path), "\\\\.\\PhysicalDrive%d", disk_number);
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return "";
+
+    std::string serial;
+    std::vector<uint8_t> buf(sizeof(STORAGE_DEVICE_DESCRIPTOR) + 512, 0);
+    STORAGE_PROPERTY_QUERY spq{};
+    spq.PropertyId = StorageDeviceProperty;
+    spq.QueryType = PropertyStandardQuery;
+    DWORD bytes = 0;
+    if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &spq, sizeof(spq),
+                        buf.data(), static_cast<DWORD>(buf.size()), &bytes, nullptr)) {
+        auto* desc = reinterpret_cast<PSTORAGE_DEVICE_DESCRIPTOR>(buf.data());
+        if (desc->SerialNumberOffset != 0) {
+            const char* p = reinterpret_cast<const char*>(buf.data() + desc->SerialNumberOffset);
+            serial.assign(p, strnlen(p, 512));
+        }
+    }
+    CloseHandle(h);
+    return serial;
+}
 
 // Sentinel returned by an offset provider to stop record iteration.
 constexpr uint64_t kNoOffset = ~0ULL;
@@ -354,8 +385,10 @@ void parse_records_at(const std::shared_ptr<ScanTask>& task, DiskReader& reader,
 
 // Scan a physical disk (bytes [0, scan_end)) for surviving $MFT record-0
 // regions. Returns them sorted by record count, largest first.
-std::vector<RawMftCandidate> scan_mft_candidates(DiskReader& reader,
-                                                 uint64_t scan_end) {
+std::vector<RawMftCandidate> scan_mft_candidates(
+    DiskReader& reader, uint64_t scan_end,
+    const std::atomic<bool>* stop = nullptr,
+    const std::function<void(uint64_t)>& on_progress = {}) {
     constexpr size_t kChunk = 4 * 1024 * 1024; // 4 MiB reads
     constexpr size_t kOverlap = 4096;          // > one record, for boundaries
 
@@ -365,6 +398,7 @@ std::vector<RawMftCandidate> scan_mft_candidates(DiskReader& reader,
 
     uint64_t off = 0;
     while (off < scan_end) {
+        if (stop && stop->load()) break;
         size_t want = static_cast<size_t>(std::min<uint64_t>(kChunk, scan_end - off));
         size_t got = 0;
         if (!reader.read(off, buf.data(), want, &got) || got < 8) break;
@@ -398,6 +432,7 @@ std::vector<RawMftCandidate> scan_mft_candidates(DiskReader& reader,
 
         if (got < want) break; // EOF reached
         off += (n > kOverlap) ? (n - kOverlap) : n;
+        if (on_progress) on_progress(off);
     }
 
     std::sort(record0_offsets.begin(), record0_offsets.end());
@@ -407,9 +442,11 @@ std::vector<RawMftCandidate> scan_mft_candidates(DiskReader& reader,
     std::vector<RawMftCandidate> out;
     std::vector<uint8_t> rec(1024);
     for (uint64_t base : record0_offsets) {
+        if (stop && stop->load()) break;
         uint64_t count = 0;
         uint64_t consecutive_invalid = 0;
         for (uint64_t i = 0; ; i++) {
+            if (stop && stop->load()) break;
             uint64_t rec_off = base + i * 1024;
             size_t rg = 0;
             if (!reader.read(rec_off, rec.data(), 1024, &rg) || rg < 8) {
@@ -535,6 +572,10 @@ void Scanner::load_saved(const std::string& data_dir) {
     data_dir_ = data_dir;
     if (data_dir_.empty()) return;
 
+    // Restore the scan-session index (data/scans.json) in addition to the
+    // per-partition result trees loaded below.
+    load_sessions();
+
     std::error_code ec;
     fs::path dir = fs::u8path(data_dir_);
     if (!fs::is_directory(dir, ec)) return;
@@ -605,6 +646,134 @@ std::vector<std::shared_ptr<ScanTask>> Scanner::list_tasks() {
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& kv : tasks_) out.push_back(kv.second);
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// Scan-session index (data/scans.json): one record per scanned physical disk,
+// keyed by serial so re-scanning the same disk replaces the previous record.
+// ---------------------------------------------------------------------------
+
+std::vector<ScanSession> Scanner::list_sessions() {
+    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    return sessions_;
+}
+
+void Scanner::record_session(const std::string& serial, int disk,
+                             const std::vector<std::string>& partitions) {
+    std::string key = serial.empty() ? ("disk" + std::to_string(disk)) : serial;
+
+    ScanSession s;
+    s.key = key;
+    s.serial = serial;
+    s.disk_number = disk;
+    s.scanned_at = static_cast<int64_t>(
+        std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+    s.partitions = partitions;
+
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        // Dedup by key: drop any prior session for this serial, then prepend so
+        // the newest scan appears first.
+        sessions_.erase(std::remove_if(sessions_.begin(), sessions_.end(),
+                                       [&](const ScanSession& x) { return x.key == key; }),
+                        sessions_.end());
+        sessions_.insert(sessions_.begin(), std::move(s));
+    }
+    save_sessions();
+}
+
+bool Scanner::delete_scan(const std::string& key) {
+    ScanSession found;
+    bool have = false;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        for (auto it = sessions_.begin(); it != sessions_.end(); ++it) {
+            if (it->key == key) {
+                found = *it;
+                sessions_.erase(it);
+                have = true;
+                break;
+            }
+        }
+    }
+    if (!have) return false;
+
+    // Drop the per-partition result files and in-memory tasks.
+    for (const auto& id : found.partitions) {
+        if (!data_dir_.empty()) {
+            std::error_code ec;
+            fs::remove(fs::u8path(data_dir_) / ("scan_" + id + ".json"), ec);
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        tasks_.erase(id);
+    }
+
+    save_sessions();
+    return true;
+}
+
+void Scanner::save_sessions() {
+    if (data_dir_.empty()) return;
+    try {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        json arr = json::array();
+        for (const auto& s : sessions_) {
+            json j;
+            j["key"] = s.key;
+            j["serial"] = s.serial;
+            j["disk_number"] = s.disk_number;
+            j["scanned_at"] = s.scanned_at;
+            j["partitions"] = s.partitions;
+            arr.push_back(std::move(j));
+        }
+
+        fs::path dir = fs::u8path(data_dir_);
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        fs::path file = dir / "scans.json";
+        fs::path tmp = dir / "scans.json.tmp";
+        {
+            std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
+            if (!ofs.is_open()) return;
+            ofs << arr.dump();
+            ofs.close();
+            if (!ofs.good()) return;
+        }
+        fs::remove(file, ec);
+        fs::rename(tmp, file, ec);
+    } catch (...) {
+        // Non-fatal: the session index is advisory; per-partition trees remain.
+    }
+}
+
+void Scanner::load_sessions() {
+    if (data_dir_.empty()) return;
+    std::error_code ec;
+    fs::path file = fs::u8path(data_dir_) / "scans.json";
+    if (!fs::exists(file, ec)) return;
+
+    try {
+        std::ifstream ifs(file, std::ios::binary);
+        json arr;
+        ifs >> arr;
+        if (!arr.is_array()) return;
+
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        sessions_.clear();
+        for (const auto& j : arr) {
+            ScanSession s;
+            s.key = j.value("key", "");
+            s.serial = j.value("serial", "");
+            s.disk_number = j.value("disk_number", -1);
+            s.scanned_at = j.value("scanned_at", static_cast<int64_t>(0));
+            if (j.contains("partitions") && j["partitions"].is_array())
+                for (const auto& p : j["partitions"])
+                    s.partitions.push_back(p.get<std::string>());
+            if (!s.key.empty()) sessions_.push_back(std::move(s));
+        }
+    } catch (...) {
+        // Corrupt index: start empty rather than crash startup.
+    }
 }
 
 std::string Scanner::debug_find_mft(int disk_number, uint64_t start, uint64_t end) {
@@ -733,6 +902,18 @@ bool Scanner::stop(const std::string& id) {
     task->stop_requested.store(true);
     task->pause_requested.store(false); // wake a paused worker so it can exit
     return true;
+}
+
+void Scanner::shutdown() {
+    std::vector<std::shared_ptr<ScanTask>> all;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& kv : tasks_) all.push_back(kv.second);
+    }
+    for (auto& t : all) {
+        t->stop_requested.store(true);
+        t->pause_requested.store(false); // wake paused workers so they can exit
+    }
 }
 
 // Build + broadcast a scan progress snapshot. `type` is "progress" during the
@@ -882,7 +1063,7 @@ void Scanner::raw_scan_worker(std::shared_ptr<ScanTask> task) {
     std::vector<RawMftCandidate> cands;
     uint64_t mft_off = task->mft_offset_hint;
     if (mft_off == 0) {
-        cands = scan_mft_candidates(reader, scan_end);
+        cands = scan_mft_candidates(reader, scan_end, &task->stop_requested);
         if (cands.empty()) {
             finish("failed", "no surviving $MFT found in the first 16 GiB");
             return;
@@ -1069,10 +1250,32 @@ void Scanner::raw_scan_all_worker(std::shared_ptr<ScanTask> meta) {
         return;
     }
 
+    const std::string serial = read_disk_serial(disk);
+
     // 1. Locate every surviving $MFT record-0 across the WHOLE disk (not just
     //    the first 16 GiB — a multi-partition disk has one $MFT per volume,
-    //    each ~3 GiB into its own volume).
-    std::vector<RawMftCandidate> cands = scan_mft_candidates(reader, full);
+    //    each ~3 GiB into its own volume). This phase used to be silent, which
+    //    made the frontend look like WebSocket wasn't connected; emit a first
+    //    event immediately, then report candidate-search progress [1, 9]%.
+    {
+        std::lock_guard<std::mutex> lock(meta->mtx);
+        meta->current_path = "正在定位 NTFS 分区 ($MFT)…";
+    }
+    meta->progress = 1;
+    emit(true);
+
+    std::vector<RawMftCandidate> cands = scan_mft_candidates(
+        reader, full, &meta->stop_requested,
+        [&](uint64_t done) {
+            if (meta->stop_requested.load()) return;
+            int pct = (full == 0) ? 5 : 1 + static_cast<int>((8 * done) / full);
+            if (pct > 9) pct = 9;
+            if (pct > meta->progress.load()) {
+                meta->progress = pct;
+                emit(false);
+            }
+        });
+    if (meta->stop_requested.load()) { finish("stopped", ""); return; }
     if (cands.empty()) {
         finish("failed", "no surviving $MFT found on the disk");
         return;
@@ -1134,9 +1337,12 @@ void Scanner::raw_scan_all_worker(std::shared_ptr<ScanTask> meta) {
     //    ("disk<N>_v<K>") so a restart reloads them the same way, and so a
     //    re-scan cleanly replaces the previous result.
     std::vector<std::shared_ptr<ScanTask>> subs;
+    std::vector<std::string> part_ids;
+    part_ids.reserve(vols.size());
     for (size_t k = 0; k < vols.size(); k++) {
         auto t = std::make_shared<ScanTask>();
         t->id = "disk" + std::to_string(disk) + "_v" + std::to_string(k);
+        part_ids.push_back(t->id);
         t->save_name = "scan_disk" + std::to_string(disk) + "_v" + std::to_string(k);
         char path[64];
         snprintf(path, sizeof(path), "\\\\.\\PhysicalDrive%d", disk);
@@ -1230,6 +1436,12 @@ void Scanner::raw_scan_all_worker(std::shared_ptr<ScanTask> meta) {
     meta->total_files.store(tf);
     meta->deleted_files.store(del);
     meta->directories.store(dirs);
+
+    // Record this whole-disk scan as one session, keyed by the disk's serial
+    // number (same serial → replace the previous record). Done even if a single
+    // partition failed, so the user still sees the other completed partitions.
+    record_session(serial, disk, part_ids);
+
     finish(any_failed ? "failed" : "completed",
            any_failed ? "one or more partitions failed to scan" : "");
 }

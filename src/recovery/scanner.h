@@ -73,6 +73,18 @@ struct ScanTask {
     }
 };
 
+// One scan "session": a single invocation of "scan the whole disk", keyed by
+// the physical disk's serial number so re-scanning the same disk replaces the
+// previous record (only the last scan per serial is kept). `partitions` are the
+// deterministic per-volume task ids ("disk<N>_v<K>").
+struct ScanSession {
+    std::string key;          // dedup key: serial, or "disk<N>" when serial unknown
+    std::string serial;       // physical disk serial ("" if unknown)
+    int  disk_number = -1;
+    int64_t scanned_at = 0;   // unix seconds
+    std::vector<std::string> partitions; // task ids "disk<N>_v<K>"
+};
+
 class Scanner {
 public:
     Scanner() = default;
@@ -123,6 +135,15 @@ public:
     bool resume(const std::string& id);
     bool stop(const std::string& id);
 
+    // Request stop on every live task so worker threads exit promptly and the
+    // destructor's join returns quickly (graceful shutdown).
+    void shutdown();
+
+    // Scan-session model (one record per scanned physical disk, deduped by
+    // serial, persisted to data/scans.json).
+    std::vector<ScanSession> list_sessions();
+    bool delete_scan(const std::string& key);  // drop session + its files/tasks
+
 private:
     void scan_worker(std::shared_ptr<ScanTask> task);
     void raw_scan_worker(std::shared_ptr<ScanTask> task);
@@ -131,6 +152,11 @@ private:
     // Build + broadcast a scan progress snapshot (throttling is the caller's job).
     void emit_scan_progress(const std::shared_ptr<ScanTask>& task, const char* type);
 
+    void record_session(const std::string& serial, int disk,
+                        const std::vector<std::string>& partitions);
+    void load_sessions();
+    void save_sessions();
+
     std::mutex mutex_;
     std::map<std::string, std::shared_ptr<ScanTask>> tasks_;
     std::atomic<uint64_t> counter_{0};
@@ -138,6 +164,9 @@ private:
     std::vector<std::thread> threads_;
     std::string data_dir_; // where completed raw scans are persisted
     std::function<void(const std::string&)> event_cb_;
+
+    std::mutex sessions_mutex_;
+    std::vector<ScanSession> sessions_;  // newest first
 };
 
 } // namespace recovery

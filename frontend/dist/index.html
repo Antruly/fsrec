@@ -252,7 +252,7 @@
     <div class="topbar-inner">
       <div class="logo">🛠️</div>
       <div class="brand">
-        <h1>fsrec <span class="ver">v1.0.0</span></h1>
+        <h1>fsrec <span class="ver">v1.0.1</span></h1>
         <p class="sub">NTFS 数据恢复 · 误格式化 / 覆盖的硬盘 · 只读扫描定位 → 手动确认恢复</p>
       </div>
       <div class="topbar-right">
@@ -260,6 +260,7 @@
         <button id="helpBtn" class="topbtn">❓ 帮助</button>
         <button id="aboutBtn" class="topbtn">ℹ️ 关于</button>
         <button id="disclaimerBtn" class="topbtn">🛡️ 免责声明</button>
+        <button id="exitBtn" class="topbtn" style="background:rgba(240,112,106,.28);border-color:rgba(240,112,106,.5)">⏻ 退出服务</button>
       </div>
     </div>
   </header>
@@ -369,7 +370,7 @@
 
   <footer class="footer">
     <div class="footer-inner">
-      <span>fsrec v1.0.0 · NTFS 数据恢复工具</span>
+      <span>fsrec v1.0.1 · NTFS 数据恢复工具</span>
       <span class="footer-sep">·</span>
       <span>扫描阶段只读，绝不写入源盘；恢复需手动确认</span>
       <span class="footer-sep">·</span>
@@ -424,7 +425,7 @@
     <div class="modal-box">
       <div class="modal-head">关于 <button class="modal-x" id="closeAbout">✕</button></div>
       <div class="help-body">
-        <h3>fsrec v1.0.0</h3>
+        <h3>fsrec v1.0.1</h3>
         <p>一款 NTFS 数据恢复工具：通过 Windows 原始磁盘读取接口解析 NTFS 文件系统，
         重建目录树，帮助你在硬盘被误格式化、分区被覆盖或文件被删除后，浏览并恢复文件与目录结构。</p>
         <h3>技术栈</h3>
@@ -538,32 +539,89 @@ async function loadSavedScans() {
   let list;
   try { list = await apiGet('/api/scans'); }
   catch (e) { return; }
-  if (!list || !list.length) return;
+  if (!list || !list.length) { $('savedPanel').style.display = 'none'; return; }
   $('savedPanel').style.display = '';
   const wrap = $('savedList');
   wrap.innerHTML = '';
   for (const s of list) {
+    const diskLabel = diskList.find(d => d.disk_number === s.disk_number);
     const item = document.createElement('div');
     item.className = 'saved-item';
-    const diskLabel = diskList.find(d => d.disk_number === s.disk_number);
-    // task_id "disk1_v0" → 磁盘 1 · 分区 1; legacy "disk1" → 磁盘 1.
-    const m = /^disk(\d+)_v(\d+)$/.exec(s.task_id);
-    const volLabel = m ? `磁盘 ${s.disk_number} · 分区 ${Number(m[2]) + 1}` : `磁盘 ${s.disk_number}`;
-    const offLabel = s.volume_start ? ` · 分区偏移 ${fmtBytes(s.volume_start)}` : '';
+    item.style.alignItems = 'flex-start';
+
     const info = document.createElement('span');
     info.className = 'info';
+    const t = s.scanned_at ? new Date(s.scanned_at * 1000) : null;
+    const timeStr = (t && !isNaN(t)) ? fmtTime(t.toISOString()) : '—';
+    const serialStr = s.serial ? ` · 序列号 <b>${esc(s.serial)}</b>` : '';
     info.innerHTML =
-      `<b>${volLabel}</b>` + (diskLabel ? ` · ${esc(diskLabel.model)}` : '') +
-      ` — 文件 <b>${s.total_files}</b> · 目录 <b>${s.directories}</b> · 已删除 <b>${s.deleted_files}</b>` +
-      `<span class="muted">${offLabel} · 簇 ${s.cluster_size} B</span>`;
-    const btn = document.createElement('button');
-    btn.className = 'btn primary';
-    btn.textContent = '加载此扫描';
-    btn.addEventListener('click', () => loadResults(s.task_id, s.disk_number));
+      `<b>磁盘 ${s.disk_number}</b>` + (diskLabel ? ` · ${esc(diskLabel.model || '')}` : '') +
+      serialStr +
+      `<span class="muted"> · 扫描于 ${timeStr} · ${s.partitions.length} 个分区</span>`;
+
+    const actions = document.createElement('div');
+    actions.style.display = 'flex';
+    actions.style.gap = '8px';
+    actions.style.alignItems = 'center';
+    actions.style.flex = '0 0 auto';
+    const delBtn = document.createElement('button');
+    delBtn.className = 'btn ghost';
+    delBtn.textContent = '🗑 删除';
+    delBtn.title = '删除这条扫描记录（删除后无法恢复）';
+    delBtn.addEventListener('click', () => deleteScan(s.key, s.partitions));
+    actions.appendChild(delBtn);
+
     item.appendChild(info);
-    item.appendChild(btn);
+    item.appendChild(actions);
     wrap.appendChild(item);
+
+    // Nested, expandable partition list for this scan session.
+    if (s.partitions && s.partitions.length) {
+      const sub = document.createElement('div');
+      sub.style.width = '100%';
+      sub.style.marginTop = '10px';
+      for (const p of s.partitions) {
+        const m = /^disk(\d+)_v(\d+)$/.exec(p.task_id);
+        const volLabel = m ? `分区 ${Number(m[2]) + 1}` : '分区';
+        const offLabel = p.volume_start ? ` · 偏移 ${fmtBytes(p.volume_start)}` : '';
+        const row = document.createElement('div');
+        row.className = 'saved-item';
+        row.style.marginTop = '6px';
+        row.style.borderColor = 'var(--border)';
+        const pinfo = document.createElement('span');
+        pinfo.className = 'info';
+        pinfo.innerHTML =
+          `<b>${volLabel}</b>` +
+          ` — 文件 <b>${p.total_files}</b> · 目录 <b>${p.directories}</b> · 已删除 <b>${p.deleted_files}</b>` +
+          `<span class="muted">${offLabel} · 簇 ${p.cluster_size} B</span>`;
+        const pbtn = document.createElement('button');
+        pbtn.className = 'btn primary';
+        pbtn.textContent = '加载此扫描';
+        pbtn.addEventListener('click', () => loadResults(p.task_id, p.disk_number));
+        row.appendChild(pinfo);
+        row.appendChild(pbtn);
+        sub.appendChild(row);
+      }
+      item.appendChild(sub);
+    }
   }
+}
+
+async function deleteScan(key, partitions) {
+  if (!confirm('确定要删除这条扫描记录吗？')) return;
+  if (!confirm('再次确认：删除后该硬盘的所有分区扫描结果将永久移除，无法恢复。确定继续？')) return;
+  try {
+    await apiPost('/api/scans/delete', { key });
+    // If the currently-loaded results belong to this scan, clear the view so
+    // the user can't keep browsing a deleted task.
+    if (Array.isArray(partitions) && partitions.some(p => p.task_id === currentTaskId)) {
+      rootTree = null; currentTaskId = null;
+      $('summaryPanel').style.display = 'none';
+      $('treePanel').style.display = 'none';
+      $('recoverPanel').style.display = 'none';
+    }
+    loadSavedScans();
+  } catch (e) { alert('删除失败：' + e.message); }
 }
 
 // ---------------------------------------------------------------------------
@@ -616,7 +674,19 @@ function setScanControls(state) {
 async function scanControl(action) {
   if (!currentScanTaskId) return;
   try { await apiPost(`/api/scan/${currentScanTaskId}/${action}`, {}); }
-  catch (e) { alert(e.message); }
+  catch (e) { alert(e.message); return; }
+  // Optimistic UI update: reflect the action immediately so the buttons change
+  // even before the next WebSocket frame / poll confirms it.
+  if (action === 'pause') {
+    setScanControls('paused');
+    $('stats').innerHTML = '<span style="color:var(--amber)">⏸ 正在暂停扫描…</span>';
+  } else if (action === 'resume') {
+    setScanControls('running');
+    $('stats').innerHTML = '▶ 正在继续扫描…';
+  } else if (action === 'stop') {
+    setScanControls('done');
+    $('stats').innerHTML = '<span style="color:var(--amber)">⏹ 正在停止扫描…</span>';
+  }
 }
 
 function applyScanState(s) {
@@ -1181,6 +1251,17 @@ $('footerDisclaimer').addEventListener('click', () => openModal('disclaimerModal
 $('closeHelp').addEventListener('click', () => closeModal('helpModal'));
 $('closeAbout').addEventListener('click', () => closeModal('aboutModal'));
 $('closeDisclaimer').addEventListener('click', () => closeModal('disclaimerModal'));
+$('exitBtn').addEventListener('click', async () => {
+  if (!confirm('确定要关闭 fsrec 服务吗？\n关闭后网页界面将无法访问，正在进行的扫描/恢复任务会被安全停止。')) return;
+  try {
+    await apiPost('/api/shutdown', {});
+    setConn(false);
+    $('connText').textContent = '服务已停止';
+    alert('服务已安全停止。现在可以关闭此页面与控制台窗口。');
+  } catch (e) {
+    alert('关闭服务失败：' + e.message);
+  }
+});
 ['helpModal', 'aboutModal', 'disclaimerModal'].forEach((id) => {
   $(id).addEventListener('click', (e) => { if (e.target === $(id)) closeModal(id); });
 });

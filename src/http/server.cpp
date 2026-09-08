@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <functional>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <vector>
 
 #include <windows.h>
@@ -263,6 +265,7 @@ json enumerate_physical_disks() {
         }
 
         std::string model;
+        std::string serial;
         std::vector<uint8_t> desc_buf(sizeof(STORAGE_DEVICE_DESCRIPTOR) + 512, 0);
         STORAGE_PROPERTY_QUERY spq{};
         spq.PropertyId = StorageDeviceProperty;
@@ -275,6 +278,10 @@ json enumerate_physical_disks() {
                 const char* p = reinterpret_cast<const char*>(desc_buf.data() + desc->ProductIdOffset);
                 model.assign(p, strnlen(p, 512));
             }
+            if (desc->SerialNumberOffset != 0) {
+                const char* p = reinterpret_cast<const char*>(desc_buf.data() + desc->SerialNumberOffset);
+                serial.assign(p, strnlen(p, 512));
+            }
         }
         CloseHandle(h);
 
@@ -283,6 +290,7 @@ json enumerate_physical_disks() {
         d["path"] = path;
         d["size"] = size;
         d["model"] = model;
+        d["serial"] = serial;
         arr.push_back(d);
     }
     return arr;
@@ -485,35 +493,77 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
             return;
         }
 
-        // GET /api/scans  — list completed raw scans (live or persisted), so the
-        // frontend can offer "reload the saved scan for disk N" without rescanning.
+        // GET /api/scans  — one record per scanned physical disk (keyed by
+        // serial), each expandable into its per-partition results. Only the last
+        // scan per serial survives; re-scanning the same disk replaces it.
         if (r == "scans" && segs.size() == 2 && is_get) {
             json arr = json::array();
-            for (auto& t : scanner_.list_tasks()) {
-                if (!t->raw || t->meta) continue;
-                std::string status;
-                {
-                    std::lock_guard<std::mutex> lock(t->mtx);
-                    status = t->status;
+            for (const auto& s : scanner_.list_sessions()) {
+                json j;
+                j["key"] = s.key;
+                j["serial"] = s.serial;
+                j["disk_number"] = s.disk_number;
+                j["scanned_at"] = s.scanned_at;
+
+                json parts = json::array();
+                for (const auto& id : s.partitions) {
+                    auto t = scanner_.get_task(id);
+                    if (!t) continue;
+                    std::string status;
+                    { std::lock_guard<std::mutex> lock(t->mtx); status = t->status; }
+                    if (status != "completed") continue;
+                    json p;
+                    p["task_id"] = t->id;
+                    p["disk_number"] = t->disk_number;
+                    p["persisted"] = t->persisted;
+                    p["save_name"] = t->save_name;
+                    p["total_files"] = t->total_files.load();
+                    p["deleted_files"] = t->deleted_files.load();
+                    p["directories"] = t->directories.load();
+                    {
+                        std::lock_guard<std::mutex> lock(t->mtx);
+                        p["mft_offset"] = t->mft_offset;
+                        p["cluster_size"] = t->cluster_size;
+                        p["volume_start"] = t->volume_start;
+                    }
+                    parts.push_back(std::move(p));
                 }
-                if (status != "completed") continue;
-                json d;
-                d["task_id"] = t->id;
-                d["disk_number"] = t->disk_number;
-                d["persisted"] = t->persisted;
-                d["save_name"] = t->save_name;
-                d["total_files"] = t->total_files.load();
-                d["deleted_files"] = t->deleted_files.load();
-                d["directories"] = t->directories.load();
-                {
-                    std::lock_guard<std::mutex> lock(t->mtx);
-                    d["mft_offset"] = t->mft_offset;
-                    d["cluster_size"] = t->cluster_size;
-                    d["volume_start"] = t->volume_start;
-                }
-                arr.push_back(d);
+                j["partitions"] = parts;
+                arr.push_back(std::move(j));
             }
             set_json(resp, uvcpp::http_status::OK, arr.dump());
+            return;
+        }
+
+        // POST /api/scans/delete  {key}  — remove a scan session (its per-
+        // partition files + in-memory tasks). The frontend double-confirms.
+        if (r == "scans" && segs.size() == 3 && segs[2] == "delete" && is_post) {
+            try {
+                json body = json::parse(req.body.to_string().empty() ? "{}" : req.body.to_string());
+                std::string key = body.value("key", "");
+                if (key.empty()) { set_error(resp, uvcpp::http_status::BAD_REQUEST, "key is required"); return; }
+                bool ok = scanner_.delete_scan(key);
+                if (!ok) { set_error(resp, uvcpp::http_status::NOT_FOUND, "scan session not found"); return; }
+                json out; out["ok"] = true;
+                set_json(resp, uvcpp::http_status::OK, out.dump());
+            } catch (const std::exception& e) {
+                set_error(resp, uvcpp::http_status::BAD_REQUEST, std::string("invalid JSON: ") + e.what());
+            }
+            return;
+        }
+
+        // POST /api/shutdown  — graceful shutdown (frontend "退出关闭服务").
+        // Respond first, then stop the loop on a detached thread so the reply
+        // is flushed before the server tears down.
+        if (r == "shutdown" && segs.size() == 2 && is_post) {
+            json out; out["ok"] = true;
+            set_json(resp, uvcpp::http_status::OK, out.dump());
+            if (shutdown_cb_) {
+                std::thread([cb = shutdown_cb_]() {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                    cb();
+                }).detach();
+            }
             return;
         }
 

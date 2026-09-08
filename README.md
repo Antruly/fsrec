@@ -5,7 +5,7 @@
 
 - **后端**：C++17 + [libuvcpp](https://github.com/zhuweiye/libuvcpp)（HTTP/WebSocket 框架，仅引用不修改）+ [nlohmann/json](https://github.com/nlohmann/json) + Windows API
 - **前端**：单文件原生 HTML/CSS/JS（`frontend/dist/index.html`，由 `uvcpp_static_server` 直接托管，无构建步骤）
-- **版本**：v1.0.0（64 位 Windows）
+- **版本**：v1.0.1（64 位 Windows）
 
 > ⚠️ **安全须知**：本工具需**管理员权限**，会直接读取原始磁盘扇区。源盘全程只读；
 > 恢复输出目录必须位于**与源盘不同的磁盘**。请勿在存有重要数据的生产机上随意测试，
@@ -86,7 +86,7 @@ D:\public\fsrec\build\Release\recovery_server.exe --no-browser   # 不自动开�
 D:\public\fsrec\build\Release\recovery_server.exe --port 8090    # 指定端口
 ```
 
-健康检查：`curl http://localhost:8080/ping` → `{"status":"ok","name":"fsrec","version":"1.0.0"}`。
+健康检查：`curl http://localhost:8080/ping` → `{"status":"ok","name":"fsrec","version":"1.0.1"}`。
 
 ## 打包发布（Inno Setup 安装包）
 
@@ -97,7 +97,7 @@ D:\public\fsrec\build\Release\recovery_server.exe --port 8090    # 指定端口
 powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
 ```
 
-产物输出到 `release\fsrec-setup-1.0.0.exe`（全中文安装向导，安装后开始菜单/桌面快捷方式，
+产物输出到 `release\fsrec_Setup_1.0.1.exe`（全中文安装向导，安装后开始菜单/桌面快捷方式，
 双击 exe 自动提权并打开浏览器）。
 
 ## API 概览

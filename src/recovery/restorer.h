@@ -68,6 +68,20 @@ public:
     // callback must be cheap and thread-safe (it is).
     void set_event_callback(std::function<void(const std::string&)> cb);
 
+    // Request stop on every in-flight job so workers exit promptly during a
+    // graceful shutdown (mirrors Scanner::shutdown).
+    void shutdown() {
+        std::vector<std::shared_ptr<RecoverJob>> all;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& kv : jobs_) all.push_back(kv.second);
+        }
+        for (auto& j : all) {
+            j->stop_requested.store(true);
+            j->pause_requested.store(false);
+        }
+    }
+
 private:
     void recover_worker(std::shared_ptr<RecoverJob> job,
                         std::shared_ptr<ScanTask> task,

@@ -3,6 +3,7 @@
 // services. Recovery progress is pushed to connected WebSocket clients via an
 // async handle that marshals events from worker threads onto the loop thread.
 
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -32,6 +33,13 @@ public:
                uvcpp::uvcpp_static_server* static_svr,
                uvcpp::uvcpp_ws_server* ws);
 
+    // Register a callback that stops the whole service (scanner + loop). It is
+    // invoked by POST /api/shutdown on a detached thread, after the HTTP
+    // response has flushed, so the client reliably receives {ok:true} first.
+    void set_shutdown_callback(std::function<void()> cb) {
+        shutdown_cb_ = std::move(cb);
+    }
+
 private:
     void handle_request(uvcpp::uvcpp_http_request& req,
                         uvcpp::uvcpp_http_response& resp,
@@ -51,6 +59,8 @@ private:
     Restorer& restorer_;
     uvcpp::uvcpp_static_server* static_ = nullptr;
     uvcpp::uvcpp_ws_server*     ws_     = nullptr;
+
+    std::function<void()> shutdown_cb_;
 
     std::shared_ptr<Hub> hub_;
     std::mutex clients_mtx_;

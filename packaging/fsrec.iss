@@ -2,7 +2,7 @@
 ; 编译：ISCC.exe packaging\fsrec.iss   （或运行 scripts\build_release.ps1）
 
 #define MyAppName "fsrec"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.1"
 #define MyAppPublisher "fsrec"
 #define MyAppExeName "recovery_server.exe"
 
@@ -16,7 +16,7 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=..\release
-OutputBaseFilename=fsrec-setup-1.0.0
+OutputBaseFilename=fsrec_Setup_{#MyAppVersion}
 SetupIconFile=..\resources\fsrec.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2
@@ -50,10 +50,10 @@ Source: "..\vc++\vcredist_vs2022_x64.exe"; DestDir: "{app}\vc++"; Flags: ignorev
 Name: "{app}\data"
 
 [Icons]
-Name: "{group}\fsrec"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
+Name: "{group}\fsrec"; Filename: "{app}\启动fsrec.bat"; WorkingDir: "{app}"
 Name: "{group}\fsrec 使用说明"; Filename: "notepad.exe"; Parameters: """{app}\docs\使用说明.md"""
 Name: "{group}\停止 fsrec"; Filename: "{app}\停止fsrec.bat"; WorkingDir: "{app}"
-Name: "{autodesktop}\fsrec"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; WorkingDir: "{app}"
+Name: "{autodesktop}\fsrec"; Filename: "{app}\启动fsrec.bat"; Tasks: desktopicon; WorkingDir: "{app}"
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--port {code:GetPort}"; Description: "立即启动 fsrec"; Flags: postinstall nowait skipifsilent
@@ -67,7 +67,8 @@ var
 function PortInUse(Port: Integer): Boolean;
 var
   ResultCode: Integer;
-  PsFile, OutFile, Line, Script: String;
+  PsFile, OutFile, Script: String;
+  Line: AnsiString;
 begin
   Result := False;
   PsFile := ExpandConstant('{tmp}\fsrec_portcheck.ps1');
