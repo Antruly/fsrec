@@ -24,8 +24,9 @@
     --radius: 14px;
     --shadow: 0 1px 2px rgba(16,24,40,.05), 0 2px 8px rgba(16,24,40,.05);
   }
+  /* 暗色主题（跟随系统）：仅当用户未显式选择亮色时生效 */
   @media (prefers-color-scheme: dark) {
-    :root {
+    :root:not([data-theme="light"]) {
       --bg: #0e1320;
       --card: #171f30;
       --border: #26304a;
@@ -42,6 +43,26 @@
       --shadow: 0 1px 2px rgba(0,0,0,.4), 0 2px 10px rgba(0,0,0,.35);
     }
   }
+  /* 暗色主题（手动选择）：无论系统偏好如何都强制生效 */
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0e1320;
+    --card: #171f30;
+    --border: #26304a;
+    --text: #e7ebf5;
+    --muted: #8b94ad;
+    --primary: #5b85ff;
+    --primary-weak: #1c2745;
+    --amber: #f0a23c;
+    --amber-bg: #2a2213;
+    --green: #3fd278;
+    --green-weak: #12251b;
+    --red: #f0706a;
+    --red-bg: #2a1b1e;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 2px 10px rgba(0,0,0,.35);
+  }
+  /* 显式亮色：仅调整 color-scheme，配色沿用 :root 的亮色默认值 */
+  :root[data-theme="light"] { color-scheme: light; }
 
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
@@ -73,6 +94,10 @@
   .banner .b-ico { font-size: 18px; line-height: 1.3; }
   .banner b { color: var(--amber); }
   .banner .b-txt { font-size: 13px; }
+  /* 更新提示横幅（主色高亮，区别于琥珀色安全横幅） */
+  .banner.update-banner { background: var(--primary-weak); border-color: var(--primary); align-items: center; }
+  .banner.update-banner b { color: var(--primary); }
+  .banner.update-banner .b-txt { flex: 1; display: flex; flex-direction: column; gap: 2px; }
 
   /* ---- card ---- */
   .card {
@@ -289,19 +314,21 @@
     .topbar-inner { padding: 0 14px; }
   }
 </style>
+<script>try{var t=localStorage.getItem('fsrec-theme');if(t==='dark'||t==='light')document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
 </head>
 <body>
   <header class="topbar">
     <div class="topbar-inner">
       <div class="logo">🛠️</div>
       <div class="brand">
-        <h1>fsrec <span class="ver">v1.0.4</span></h1>
+        <h1>fsrec <span class="ver">v1.0.5</span></h1>
         <p class="sub">NTFS 数据恢复 · 误格式化 / 覆盖的硬盘 · 只读扫描定位 → 手动确认恢复</p>
       </div>
       <div class="topbar-right">
         <span class="conn" id="connStatus"><span class="dot"></span><span id="connText">连接中…</span></span>
         <span class="iostat" id="ioStat" title="磁盘实时读取速度（WebSocket 实时推送）"><span class="dot"></span>💾 <b id="ioMbps">0.0</b> MB/s</span>
         <a class="gh-btn" href="https://github.com/Antruly/fsrec" target="_blank" rel="noopener" title="GitHub 仓库"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg></a>
+        <button id="themeBtn" class="topbtn" title="切换亮色/暗色主题">🌙 暗色</button>
         <button id="helpBtn" class="topbtn">❓ 帮助</button>
         <button id="aboutBtn" class="topbtn">ℹ️ 关于</button>
         <button id="disclaimerBtn" class="topbtn">🛡️ 免责声明</button>
@@ -317,6 +344,17 @@
       <div class="b-txt">
         <b>安全须知：</b>扫描阶段只读，<b>绝不写入源盘</b>；恢复阶段需你在下方手动勾选文件、填写输出目录并再次确认后才开始。<b>严禁选择磁盘 0 / 系统盘</b>，恢复输出目录必须位于<b>另一块磁盘</b>。
       </div>
+    </div>
+
+    <!-- 更新提示（检测到 GitHub 新版本时显示） -->
+    <div class="banner update-banner" id="updateBanner" style="display:none">
+      <span class="b-ico">🎉</span>
+      <div class="b-txt">
+        <b>发现新版本 <span id="updateVer"></span></b>
+        <span id="updateMsg" style="color:var(--muted)"></span>
+      </div>
+      <a id="updateDownload" class="btn primary" target="_blank" rel="noopener">⬇️ 下载安装包</a>
+      <button id="updateDismiss" class="btn ghost" title="忽略">✕</button>
     </div>
 
     <!-- 步骤指示 -->
@@ -415,7 +453,7 @@
 
   <footer class="footer">
     <div class="footer-inner">
-      <span>fsrec <span class="ver">v1.0.4</span> · NTFS 数据恢复工具</span>
+      <span>fsrec <span class="ver">v1.0.5</span> · NTFS 数据恢复工具</span>
       <span class="footer-sep">·</span>
       <span>扫描阶段只读，绝不写入源盘；恢复需手动确认</span>
       <span class="footer-sep">·</span>
@@ -471,7 +509,7 @@
       <div class="modal-head">关于 fsrec <button class="modal-x" id="closeAbout">✕</button></div>
       <div class="about-body">
         <div class="about-logo">🛠️</div>
-        <h2 class="about-title">fsrec <span class="ver">v1.0.4</span></h2>
+        <h2 class="about-title">fsrec <span class="ver">v1.0.5</span></h2>
         <p class="about-tagline">NTFS 数据恢复工具</p>
         <p class="about-desc">通过 Windows 原始磁盘读取接口解析 NTFS 文件系统、重建目录树，帮助你在硬盘被误格式化、分区被覆盖或文件被删除后，浏览并恢复文件与目录结构。</p>
         <div class="about-stack">
@@ -1604,11 +1642,73 @@ $('exitBtn').addEventListener('click', async () => {
   $(id).addEventListener('click', (e) => { if (e.target === $(id)) closeModal(id); });
 });
 
+// ---------------------------------------------------------------------------
+// 主题切换（亮色 / 暗色，localStorage 持久化；首次访问跟随系统偏好）
+// ---------------------------------------------------------------------------
+function applyTheme(theme, persist) {
+  document.documentElement.setAttribute('data-theme', theme);
+  const btn = $('themeBtn');
+  btn.textContent = theme === 'dark' ? '☀️ 亮色' : '🌙 暗色';
+  btn.title = theme === 'dark' ? '切换到亮色模式' : '切换到暗色模式';
+  if (persist) { try { localStorage.setItem('fsrec-theme', theme); } catch (e) {} }
+}
+function initTheme() {
+  let saved = null;
+  try { saved = localStorage.getItem('fsrec-theme'); } catch (e) {}
+  if (saved === 'light' || saved === 'dark') { applyTheme(saved, false); return; }
+  const dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  applyTheme(dark ? 'dark' : 'light', false);
+}
+$('themeBtn').addEventListener('click', () => {
+  const cur = document.documentElement.getAttribute('data-theme');
+  applyTheme(cur === 'dark' ? 'light' : 'dark', true);
+});
+
+// ---------------------------------------------------------------------------
+// 检查更新：拉取 GitHub 最新 release，有更新则显示下载横幅
+// ---------------------------------------------------------------------------
+function cmpVersion(a, b) {
+  const pa = String(a || '').replace(/^v/i, '').split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = String(b || '').replace(/^v/i, '').split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i] || 0, y = pb[i] || 0;
+    if (x !== y) return x > y ? 1 : -1;
+  }
+  return 0;
+}
+async function checkForUpdates() {
+  let current = '';
+  try { current = (await apiGet('/ping')).version || ''; } catch (e) { return; }
+  if (!current) return;
+  let latest;
+  try {
+    const r = await fetch('https://api.github.com/repos/Antruly/fsrec/releases/latest', {
+      headers: { 'Accept': 'application/vnd.github+json' }
+    });
+    if (!r.ok) return;
+    latest = await r.json();
+  } catch (e) { return; }
+  const tag = latest && latest.tag_name ? String(latest.tag_name) : '';
+  if (!tag || cmpVersion(tag, current) <= 0) return; // 已是最新
+  let url = latest.html_url || '';
+  if (Array.isArray(latest.assets)) {
+    const exe = latest.assets.find((a) => /\.exe$/i.test(a.name || ''));
+    if (exe && exe.browser_download_url) url = exe.browser_download_url;
+  }
+  $('updateVer').textContent = 'v' + tag.replace(/^v/i, '');
+  $('updateMsg').textContent = '当前版本 v' + current + '，可下载最新安装包升级。';
+  $('updateDownload').href = url;
+  $('updateBanner').style.display = '';
+}
+$('updateDismiss').addEventListener('click', () => { $('updateBanner').style.display = 'none'; });
+
+initTheme();
 heartbeat();
 connectWS();
 loadDisks();
 loadSavedScans();
 restoreActive();
+checkForUpdates();
 </script>
 </body>
 </html>
