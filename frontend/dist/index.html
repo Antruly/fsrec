@@ -204,6 +204,12 @@
   .saved-actions { display: flex; gap: 8px; align-items: center; flex: 0 0 auto; }
   .saved-sub { display: flex; flex-direction: column; gap: 6px; }
   .saved-row { display: flex; align-items: center; gap: 14px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; }
+  .scan-status { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 700; padding: 1px 9px; border-radius: 999px; white-space: nowrap; }
+  .scan-status.ok { color: var(--green); background: var(--green-weak); }
+  .scan-status.bad { color: var(--red); background: var(--red-bg); }
+  .banner.danger { background: var(--red-bg); border-color: var(--red); align-items: center; }
+  .banner.danger b { color: var(--red); }
+  .banner.danger .b-txt { flex: 1; display: flex; flex-direction: column; gap: 2px; }
 
   /* ---- tree ---- */
   .tree-toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
@@ -325,7 +331,7 @@
     <div class="topbar-inner">
       <div class="logo">🛠️</div>
       <div class="brand">
-        <h1>fsrec <span class="ver">v1.0.7</span></h1>
+        <h1>fsrec <span class="ver">v1.0.8</span></h1>
         <p class="sub">NTFS 数据恢复 · 误格式化 / 覆盖的硬盘 · 只读扫描定位 → 手动确认恢复</p>
       </div>
       <div class="topbar-right">
@@ -426,6 +432,13 @@
         <span class="step">4</span><h2>恢复选中的文件</h2>
         <span class="hint-inline">可随时暂停 / 继续 / 停止</span>
       </div>
+      <div class="banner danger" id="srcDisconnected" style="display:none">
+        <span class="b-ico">⚠️</span>
+        <div class="b-txt">
+          <b>源磁盘已断开连接，无法恢复</b>
+          <span class="muted">该扫描的源磁盘 <b id="srcDiskNum"></b> 当前未连接，请重新挂载后刷新页面再恢复。</span>
+        </div>
+      </div>
       <div class="form-row">
         <div class="field" style="flex:1 1 100%">
           <label>输出目录</label>
@@ -457,7 +470,7 @@
 
   <footer class="footer">
     <div class="footer-inner">
-      <span>fsrec <span class="ver">v1.0.7</span> · NTFS 数据恢复工具</span>
+      <span>fsrec <span class="ver">v1.0.8</span> · NTFS 数据恢复工具</span>
       <span class="footer-sep">·</span>
       <span>扫描阶段只读，绝不写入源盘；恢复需手动确认</span>
       <span class="footer-sep">·</span>
@@ -513,7 +526,7 @@
       <div class="modal-head">关于 fsrec <button class="modal-x" id="closeAbout">✕</button></div>
       <div class="about-body">
         <div class="about-logo">🛠️</div>
-        <h2 class="about-title">fsrec <span class="ver">v1.0.7</span></h2>
+        <h2 class="about-title">fsrec <span class="ver">v1.0.8</span></h2>
         <p class="about-tagline">NTFS 数据恢复工具</p>
         <p class="about-desc">通过 Windows 原始磁盘读取接口解析 NTFS 文件系统、重建目录树，帮助你在硬盘被误格式化、分区被覆盖或文件被删除后，浏览并恢复文件与目录结构。</p>
         <div class="about-stack">
@@ -563,6 +576,7 @@ let diskStat = {};    // disk_number -> {r, w, u} read/write MB/s + util % (from
 let diskHistory = {}; // disk_number -> [{t, r, w, u}] rolling window for the chart
 let expandedDisk = null; // disk number whose real-time chart is open
 let scanDiskNumber = null; // disk currently being scanned (for hot-unplug prompt)
+let sourceConnected = true; // whether the loaded scan's source disk is currently attached
 
 const $ = (id) => document.getElementById(id);
 
@@ -582,6 +596,20 @@ function fmtTime(iso) {
 }
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+// Serial "0000...00" is what some disks / bridges report; treat it as "no serial".
+function isZeroSerial(s) {
+  return !s || /^0+$/.test(String(s).trim());
+}
+// Is a saved scan's source disk still attached? Match by serial when we have a
+// real one, otherwise fall back to the physical disk number.
+function diskConnected(diskNumber, serial) {
+  if (!diskList || !diskList.length) return true; // enumeration failed -> don't warn falsely
+  const dn = Number(diskNumber);
+  return diskList.some(d =>
+    isZeroSerial(serial)
+      ? (Number(d.disk_number) === dn)
+      : (String(d.serial || '').trim() === String(serial).trim()));
 }
 
 async function apiGet(path) {
@@ -842,10 +870,15 @@ async function loadSavedScans() {
     info.className = 'info';
     const t = s.scanned_at ? new Date(s.scanned_at * 1000) : null;
     const timeStr = (t && !isNaN(t)) ? fmtTime(t.toISOString()) : '—';
-    const serialStr = s.serial ? ` · 序列号 <b>${esc(s.serial)}</b>` : '';
+    const connected = diskConnected(s.disk_number, s.serial);
+    const serialStr = (connected && !isZeroSerial(s.serial)) ? ` · 序列号 <b>${esc(s.serial)}</b>` : '';
+    const statusStr = connected
+      ? '<span class="scan-status ok">● 已连接</span>'
+      : '<span class="scan-status bad">⚠ 磁盘已断开连接，请重新挂载</span>';
     info.innerHTML =
       `<b>磁盘 ${s.disk_number}</b>` + (diskLabel ? ` · ${esc(diskLabel.model || '')}` : '') +
       serialStr +
+      ` · ${statusStr}` +
       `<span class="muted"> · 扫描于 ${timeStr} · ${s.partitions.length} 个分区</span>`;
 
     const actions = document.createElement('div');
@@ -1073,6 +1106,9 @@ async function loadResults(taskId, disk) {
     rootTree = tree;
     currentTaskId = taskId;
     currentDiskNumber = disk;
+    sourceConnected = diskConnected(disk, null);
+    $('srcDisconnected').style.display = sourceConnected ? 'none' : '';
+    $('srcDiskNum').textContent = disk;
     checked = new Set();
     buildIndex();
     renderSummary();
@@ -1311,7 +1347,7 @@ function updateSelCount() {
   const n = topmostCheckedPaths().length;
   $('selCount').textContent = n;
   $('estSize').textContent = fmtBytes(computeSelectedSize());
-  $('recoverBtn').disabled = n === 0 || !$('outputDir').value.trim();
+  $('recoverBtn').disabled = n === 0 || !$('outputDir').value.trim() || !sourceConnected;
   evaluateSpace();
 }
 
@@ -1414,7 +1450,7 @@ function setRecoverControls(state) {
   $('stopBtn').disabled   = !(running || paused);
   $('recoverBtn').disabled = (running || paused)
     ? true
-    : (topmostCheckedPaths().length === 0 || !$('outputDir').value.trim());
+    : (topmostCheckedPaths().length === 0 || !$('outputDir').value.trim() || !sourceConnected);
 }
 
 function applyRecoverState(s) {
@@ -1463,6 +1499,7 @@ function applyRecoverState(s) {
 async function onRecover() {
   const paths = topmostCheckedPaths();
   const outputDir = $('outputDir').value.trim();
+  if (!sourceConnected) { alert('源磁盘已断开连接，无法恢复。请重新挂载磁盘后刷新页面再恢复。'); return; }
   if (!paths.length) return;
   if (!outputDir) { alert('请先浏览选择输出目录'); return; }
   const est = computeSelectedSize();
@@ -1706,9 +1743,11 @@ $('updateDismiss').addEventListener('click', () => { $('updateBanner').style.dis
 initTheme();
 heartbeat();
 connectWS();
-loadDisks();
-loadSavedScans();
-restoreActive();
+(async () => {
+  await loadDisks();      // populate diskList first so saved-scan connection checks are accurate
+  await loadSavedScans();
+  await restoreActive();
+})();
 checkForUpdates();
 </script>
 </body>
