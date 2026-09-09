@@ -673,6 +673,8 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
                 json j;
                 j["key"] = s.key;
                 j["serial"] = s.serial;
+                j["model"] = s.model;
+                j["size"] = s.size;
                 j["disk_number"] = s.disk_number;
                 j["scanned_at"] = s.scanned_at;
 
@@ -688,6 +690,7 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
                     p["disk_number"] = t->disk_number;
                     p["persisted"] = t->persisted;
                     p["save_name"] = t->save_name;
+                    p["fs"] = fs_type_name(t->fs_type);
                     p["total_files"] = t->total_files.load();
                     p["deleted_files"] = t->deleted_files.load();
                     p["directories"] = t->directories.load();
@@ -799,6 +802,7 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
             out["directories"] = t->directories.load();
             out["raw"] = t->raw;
             out["disk_number"] = t->disk_number;
+            out["fs"] = fs_type_name(t->fs_type);
             {
                 std::lock_guard<std::mutex> lock(t->mtx);
                 out["status"] = t->status;

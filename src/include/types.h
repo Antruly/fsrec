@@ -32,6 +32,40 @@ struct NTFSBootInfo {
 };
 
 // ---------------------------------------------------------------------------
+// Filesystem families recognized by the scanner. NTFS is the original target;
+// FAT12/16/32 and exFAT share the same FileNode/DataRun model so browsing,
+// searching and recovery work unchanged.
+// ---------------------------------------------------------------------------
+enum class FsType {
+    Unknown,
+    NTFS,
+    FAT12,
+    FAT16,
+    FAT32,
+    exFAT,
+};
+
+inline const char* fs_type_name(FsType t) {
+    switch (t) {
+        case FsType::NTFS:  return "NTFS";
+        case FsType::FAT12: return "FAT12";
+        case FsType::FAT16: return "FAT16";
+        case FsType::FAT32: return "FAT32";
+        case FsType::exFAT: return "exFAT";
+        default:            return "Unknown";
+    }
+}
+
+inline FsType fs_type_from_name(const std::string& s) {
+    if (s == "NTFS")  return FsType::NTFS;
+    if (s == "FAT12") return FsType::FAT12;
+    if (s == "FAT16") return FsType::FAT16;
+    if (s == "FAT32") return FsType::FAT32;
+    if (s == "exFAT") return FsType::exFAT;
+    return FsType::Unknown;
+}
+
+// ---------------------------------------------------------------------------
 // A single data run (extent) of a non-resident attribute.
 // ---------------------------------------------------------------------------
 struct DataRun {

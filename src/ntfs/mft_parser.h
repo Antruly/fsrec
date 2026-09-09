@@ -2,6 +2,7 @@
 // NTFS $MFT record parser.
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -38,7 +39,14 @@ public:
 
     // Parse a raw record buffer into a FileNode. Returns false if the record
     // is not a valid "FILE" record or is a non-base (extension) record.
-    bool parse_record(const std::vector<uint8_t>& buffer, FileNode& node);
+    //
+    // `ext_reader` (optional) reads an extension record by number into `buffer`
+    // (already USA-fixed) and returns true on success. When provided, a resident
+    // $ATTRIBUTE_LIST is followed so a non-resident $DATA whose run list is
+    // split across extension records is reassembled into `node.data_runs` in VCN
+    // order; without it such a file is listed but marked unrecoverable.
+    bool parse_record(const std::vector<uint8_t>& buffer, FileNode& node,
+                      const std::function<bool(uint64_t, std::vector<uint8_t>&)>& ext_reader = {});
 
     // Apply the Update Sequence Array fixup in place. Returns false on
     // inconsistent USA (which we tolerate by leaving data as-is).

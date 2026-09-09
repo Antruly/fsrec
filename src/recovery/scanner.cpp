@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 #include "../include/util.h"
+#include "../fat/fat.h"
 #include "../ntfs/boot_parser.h"
 #include "../ntfs/disk_reader.h"
 #include "../ntfs/mft_parser.h"
@@ -132,6 +133,7 @@ bool save_scan_file(const std::shared_ptr<ScanTask>& task, const std::string& da
         FileNodePtr root;
         uint64_t cluster_size = 0, volume_start = 0, mft_offset = 0, mft_records_total = 0;
         uint64_t total = 0, deleted = 0, dirs = 0;
+        FsType fs = FsType::NTFS;
         {
             std::lock_guard<std::mutex> lock(task->mtx);
             root = task->root;
@@ -142,12 +144,14 @@ bool save_scan_file(const std::shared_ptr<ScanTask>& task, const std::string& da
             total = task->total_files.load();
             deleted = task->deleted_files.load();
             dirs = task->directories.load();
+            fs = task->fs_type;
         }
         if (!root) return false;
 
         json j;
         j["version"] = 1;
         j["disk_number"] = task->disk_number;
+        j["fs"] = fs_type_name(fs);
         j["mft_offset"] = mft_offset;
         j["cluster_size"] = cluster_size;
         j["volume_start"] = volume_start;
@@ -184,17 +188,22 @@ bool save_scan_file(const std::shared_ptr<ScanTask>& task, const std::string& da
 
 
 
-// Read a physical disk's serial number (STORAGE_DEVICE_DESCRIPTOR /
-// SerialNumberOffset). Returns "" when unavailable (e.g. no access or no
-// vendor-supplied serial), in which case callers key by "disk<N>" instead.
-std::string read_disk_serial(int disk_number) {
+// Read a physical disk's stable identity: model (STORAGE_DEVICE_DESCRIPTOR /
+// ProductIdOffset) and serial (SerialNumberOffset). The serial is the strongest
+// key, but many disks / USB bridges report an all-zero serial; callers then
+// match by (model, size) so a reused \\.\PhysicalDriveN number never causes a
+// false "same disk" match. Returns false when the disk can't be opened.
+bool read_disk_model_serial(int disk_number, std::string& model,
+                            std::string& serial) {
+    model.clear();
+    serial.clear();
+
     char path[64];
     snprintf(path, sizeof(path), "\\\\.\\PhysicalDrive%d", disk_number);
     HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                            nullptr, OPEN_EXISTING, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return "";
+    if (h == INVALID_HANDLE_VALUE) return false;
 
-    std::string serial;
     std::vector<uint8_t> buf(sizeof(STORAGE_DEVICE_DESCRIPTOR) + 512, 0);
     STORAGE_PROPERTY_QUERY spq{};
     spq.PropertyId = StorageDeviceProperty;
@@ -203,13 +212,17 @@ std::string read_disk_serial(int disk_number) {
     if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &spq, sizeof(spq),
                         buf.data(), static_cast<DWORD>(buf.size()), &bytes, nullptr)) {
         auto* desc = reinterpret_cast<PSTORAGE_DEVICE_DESCRIPTOR>(buf.data());
+        if (desc->ProductIdOffset != 0) {
+            const char* p = reinterpret_cast<const char*>(buf.data() + desc->ProductIdOffset);
+            model.assign(p, strnlen(p, 512));
+        }
         if (desc->SerialNumberOffset != 0) {
             const char* p = reinterpret_cast<const char*>(buf.data() + desc->SerialNumberOffset);
             serial.assign(p, strnlen(p, 512));
         }
     }
     CloseHandle(h);
-    return serial;
+    return true;
 }
 
 // Sentinel returned by an offset provider to stop record iteration.
@@ -342,6 +355,20 @@ void parse_records_at(const std::shared_ptr<ScanTask>& task, DiskReader& reader,
     uint64_t consecutive_invalid = 0;
     std::string last_name; // UTF-8 name of the last record successfully parsed
 
+    // Reads an extension record by number (USA-fixed) so parse_record can follow
+    // a $ATTRIBUTE_LIST to reassemble a run list split across records.
+    auto ext_reader = [&](uint64_t rec_num, std::vector<uint8_t>& out) -> bool {
+        uint64_t eoff = offset_fn(rec_num);
+        if (eoff == kNoOffset) return false;
+        std::vector<uint8_t> b(1024);
+        size_t egot = 0;
+        if (!reader.read(eoff, b.data(), 1024, &egot) || egot < 512) return false;
+        if (std::memcmp(b.data(), "FILE", 4) != 0) return false;
+        MftParser::apply_usa_fixup(b, bytes_per_sector);
+        out = std::move(b);
+        return true;
+    };
+
     for (uint64_t i = 0; i < total_records; i++) {
         uint64_t off = offset_fn(i);
         if (off == kNoOffset) break;
@@ -361,7 +388,7 @@ void parse_records_at(const std::shared_ptr<ScanTask>& task, DiskReader& reader,
         MftParser::apply_usa_fixup(buf, bytes_per_sector);
 
         FileNode node;
-        if (mft.parse_record(buf, node)) {
+        if (mft.parse_record(buf, node, ext_reader)) {
             if (node.mft_id == 0 && i != 0) node.mft_id = i;
             last_name = utf16_to_utf8(node.name);
             auto p = std::make_shared<FileNode>(std::move(node));
@@ -473,6 +500,124 @@ std::vector<RawMftCandidate> scan_mft_candidates(
               [](const RawMftCandidate& a, const RawMftCandidate& b) {
                   return a.record_count > b.record_count;
               });
+    return out;
+}
+
+// One FAT12/16/32 or exFAT volume located via the MBR partition table (or a
+// "superfloppy" whose boot sector sits at sector 0).
+struct FatVolume {
+    uint64_t volume_start = 0;  // absolute byte offset on the physical disk
+    uint64_t cluster_size = 0;
+    FsType fs = FsType::Unknown;
+};
+
+// Locate FAT/exFAT volumes by reading the MBR partition table. NTFS partitions
+// are NOT added here — the $MFT record-0 search handles them — but their
+// presence is reported via `*need_mft_search` so the caller can skip the
+// expensive whole-disk $MFT scan when the disk is pure FAT/exFAT. GPT disks
+// (protective MBR type 0xEE) and extended partitions are not yet parsed; they
+// set `*need_mft_search` so the caller falls back to the $MFT search.
+std::vector<FatVolume> detect_mbr_fat_volumes(DiskReader& reader, bool* need_mft_search) {
+    std::vector<FatVolume> out;
+    if (need_mft_search) *need_mft_search = false;
+
+    std::vector<uint8_t> s0(512);
+    if (!reader.read(0, s0.data(), 512)) {
+        // Can't even read sector 0 → we know nothing; fall back to $MFT search.
+        if (need_mft_search) *need_mft_search = true;
+        return out;
+    }
+
+    // "Superfloppy": no partition table; the FAT/exFAT boot sector is sector 0.
+    FsType t0 = detect_fs_type(s0.data());
+    if (t0 == FsType::FAT12 || t0 == FsType::FAT16 || t0 == FsType::FAT32 || t0 == FsType::exFAT) {
+        FatVolume fv;
+        fv.volume_start = 0;
+        fv.fs = t0;
+        if (t0 == FsType::exFAT) {
+            ExfatBootInfo ei;
+            if (parse_exfat_boot(s0.data(), ei)) fv.cluster_size = ei.cluster_size();
+        } else {
+            FatBootInfo fi;
+            if (parse_fat_boot(s0.data(), fi)) fv.cluster_size = fi.cluster_size();
+        }
+        if (fv.cluster_size) out.push_back(fv);
+        return out;  // pure FAT superfloppy → no $MFT search
+    }
+    if (t0 == FsType::NTFS) {
+        // NTFS superfloppy (no partition table) → only the $MFT search finds it.
+        if (need_mft_search) *need_mft_search = true;
+        return out;
+    }
+
+    if (le16(s0.data() + 510) != 0xAA55) {
+        // Unknown layout → safest to run the $MFT search.
+        if (need_mft_search) *need_mft_search = true;
+        return out;
+    }
+
+    bool any_partition = false;
+    for (int i = 0; i < 4; i++) {
+        const uint8_t* e = s0.data() + 0x1BE + i * 16;
+        uint8_t type = e[4];
+        uint32_t start_lba = le32(e + 8);
+        uint32_t sectors = le32(e + 12);
+        if (sectors == 0 || start_lba == 0) continue;
+        any_partition = true;
+
+        // GPT protective MBR — GPT partitions are not parsed yet.
+        if (type == 0xEE) {
+            if (need_mft_search) *need_mft_search = true;
+            continue;
+        }
+
+        // Extended partition (logical volumes not parsed) → fall back.
+        if (type == 0x05 || type == 0x0F || type == 0x85) {
+            if (need_mft_search) *need_mft_search = true;
+            continue;
+        }
+
+        // FAT-capable types (0xEF = EFI System Partition, which is FAT12/16/32).
+        bool fat_type = (type == 0x01 || type == 0x04 || type == 0x06 ||
+                         type == 0x0B || type == 0x0C || type == 0x0E ||
+                         type == 0xEF);
+        // NTFS-capable types.
+        bool ntfs_type = (type == 0x07 || type == 0x17 || type == 0x27);
+
+        std::vector<uint8_t> boot(512);
+        if (!reader.read(static_cast<uint64_t>(start_lba) * 512, boot.data(), 512)) {
+            // Unreadable partition — can't rule out NTFS.
+            if (!fat_type) { if (need_mft_search) *need_mft_search = true; }
+            continue;
+        }
+
+        FsType fs = detect_fs_type(boot.data());
+        if (fs == FsType::exFAT) {
+            ExfatBootInfo ei;
+            if (!parse_exfat_boot(boot.data(), ei)) { if (need_mft_search) *need_mft_search = true; continue; }
+            FatVolume fv;
+            fv.volume_start = static_cast<uint64_t>(start_lba) * 512;
+            fv.cluster_size = ei.cluster_size();
+            fv.fs = FsType::exFAT;
+            out.push_back(fv);
+        } else if (fs == FsType::FAT12 || fs == FsType::FAT16 || fs == FsType::FAT32) {
+            FatBootInfo fi;
+            if (!parse_fat_boot(boot.data(), fi)) { if (need_mft_search) *need_mft_search = true; continue; }
+            FatVolume fv;
+            fv.volume_start = static_cast<uint64_t>(start_lba) * 512;
+            fv.cluster_size = fi.cluster_size();
+            fv.fs = fs;
+            out.push_back(fv);
+        } else {
+            // NTFS (handled by $MFT search) or unrecognized → may need $MFT search.
+            if (need_mft_search) *need_mft_search = true;
+        }
+    }
+
+    // An MBR with zero usable partitions → fall back to the $MFT search.
+    if (!any_partition) {
+        if (need_mft_search) *need_mft_search = true;
+    }
     return out;
 }
 
@@ -624,6 +769,7 @@ void Scanner::load_saved(const std::string& data_dir) {
             task->cluster_size = j.value("cluster_size", static_cast<uint64_t>(0));
             task->volume_start = j.value("volume_start", static_cast<uint64_t>(0));
             task->mft_records_total = j.value("mft_records_total", static_cast<uint64_t>(0));
+            task->fs_type = fs_type_from_name(j.value("fs", std::string("NTFS")));
             task->total_files.store(j.value("total_files", static_cast<uint64_t>(0)));
             task->deleted_files.store(j.value("deleted_files", static_cast<uint64_t>(0)));
             task->directories.store(j.value("directories", static_cast<uint64_t>(0)));
@@ -658,13 +804,16 @@ std::vector<ScanSession> Scanner::list_sessions() {
     return sessions_;
 }
 
-void Scanner::record_session(const std::string& serial, int disk,
+void Scanner::record_session(const std::string& serial, const std::string& model,
+                             uint64_t size, int disk,
                              const std::vector<std::string>& partitions) {
     std::string key = serial.empty() ? ("disk" + std::to_string(disk)) : serial;
 
     ScanSession s;
     s.key = key;
     s.serial = serial;
+    s.model = model;
+    s.size = size;
     s.disk_number = disk;
     s.scanned_at = static_cast<int64_t>(
         std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
@@ -721,6 +870,8 @@ void Scanner::save_sessions() {
             json j;
             j["key"] = s.key;
             j["serial"] = s.serial;
+            j["model"] = s.model;
+            j["size"] = s.size;
             j["disk_number"] = s.disk_number;
             j["scanned_at"] = s.scanned_at;
             j["partitions"] = s.partitions;
@@ -764,6 +915,8 @@ void Scanner::load_sessions() {
             ScanSession s;
             s.key = j.value("key", "");
             s.serial = j.value("serial", "");
+            s.model = j.value("model", "");
+            s.size = j.value("size", static_cast<uint64_t>(0));
             s.disk_number = j.value("disk_number", -1);
             s.scanned_at = j.value("scanned_at", static_cast<int64_t>(0));
             if (j.contains("partitions") && j["partitions"].is_array())
@@ -1213,6 +1366,85 @@ void Scanner::raw_scan_worker(std::shared_ptr<ScanTask> task) {
     save_scan_file(task, data_dir_);
 }
 
+void Scanner::fat_scan_worker(std::shared_ptr<ScanTask> task) {
+    auto last_emit = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    auto emit = [&](bool force, const char* type = "progress") {
+        auto now = std::chrono::steady_clock::now();
+        if (!force && now - last_emit < std::chrono::milliseconds(50)) return;
+        last_emit = now;
+        emit_scan_progress(task, type);
+    };
+
+    auto finish = [&](const std::string& status, const std::string& err) {
+        {
+            std::lock_guard<std::mutex> lock(task->mtx);
+            task->status = status;
+            task->error = err;
+            task->current_path.clear();
+        }
+        if (status == "completed") task->progress = 100;
+        const char* t = (status == "completed") ? "done"
+                        : (status == "stopped") ? "stopped"
+                        : "error";
+        emit(true, t);
+    };
+
+    DiskReader reader;
+    std::string err;
+    if (!reader.open_physical(task->disk_number, &err)) {
+        finish("failed", "open physical disk: " + err);
+        return;
+    }
+    reader.set_base_offset(task->volume_start);
+
+    // Re-read + parse the boot sector (cheap; keeps this worker self-contained).
+    std::vector<uint8_t> boot(512);
+    if (!reader.read(0, boot.data(), 512)) {
+        finish("failed", "failed to read boot sector");
+        return;
+    }
+
+    FsType fs = task->fs_type;
+    FatScanResult res;
+    bool ok = false;
+    if (fs == FsType::exFAT) {
+        ExfatBootInfo ei;
+        if (!parse_exfat_boot(boot.data(), ei, &err)) {
+            finish("failed", "parse exFAT boot sector: " + err);
+            return;
+        }
+        ok = scan_exfat_volume(reader, ei, res, task->stop_requested, &err);
+    } else if (fs == FsType::FAT12 || fs == FsType::FAT16 || fs == FsType::FAT32) {
+        FatBootInfo fi;
+        if (!parse_fat_boot(boot.data(), fi, &err)) {
+            finish("failed", "parse FAT boot sector: " + err);
+            return;
+        }
+        ok = scan_fat_volume(reader, fi, res, task->stop_requested, &err);
+    } else {
+        finish("failed", "unsupported filesystem type");
+        return;
+    }
+
+    if (!ok) {
+        if (task->stop_requested.load()) finish("stopped", "");
+        else finish("failed", err.empty() ? "filesystem scan failed" : err);
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(task->mtx);
+        task->root = res.root;
+        task->nodes = std::move(res.nodes);
+        task->total_files.store(res.total_files);
+        task->deleted_files.store(res.deleted_files);
+        task->directories.store(res.directories);
+    }
+
+    finish("completed", "");
+    save_scan_file(task, data_dir_);
+}
+
 void Scanner::raw_scan_all_worker(std::shared_ptr<ScanTask> meta) {
     auto last_emit = std::chrono::steady_clock::now() - std::chrono::seconds(1);
     auto emit = [&](bool force, const char* type = "progress") {
@@ -1265,35 +1497,46 @@ void Scanner::raw_scan_all_worker(std::shared_ptr<ScanTask> meta) {
         return;
     }
 
-    const std::string serial = read_disk_serial(disk);
+    std::string serial, model;
+    read_disk_model_serial(disk, model, serial);
 
-    // 1. Locate every surviving $MFT record-0 across the WHOLE disk (not just
-    //    the first 16 GiB — a multi-partition disk has one $MFT per volume,
-    //    each ~3 GiB into its own volume). This phase used to be silent, which
-    //    made the frontend look like WebSocket wasn't connected; emit a first
-    //    event immediately, then report candidate-search progress [1, 9]%.
+    // 1. Locate partitions. FAT/exFAT volumes come from the MBR partition table
+    //    (cheap: MBR + one boot sector per partition), so detect them FIRST and
+    //    only run the expensive whole-disk $MFT search when the disk may also
+    //    hold NTFS volumes. This makes a pure-FAT USB scan in seconds instead of
+    //    minutes. NTFS partitions stay on the $MFT record-0 search path below.
     {
         std::lock_guard<std::mutex> lock(meta->mtx);
-        meta->current_path = "正在定位 NTFS 分区 ($MFT)…";
+        meta->current_path = "正在定位分区 ($MFT / FAT / exFAT)…";
     }
     meta->progress = 1;
     emit(true);
 
-    std::vector<RawMftCandidate> cands = scan_mft_candidates(
-        reader, full, &meta->stop_requested,
-        [&](uint64_t done) {
-            check_pause();
-            if (meta->stop_requested.load()) return;
-            int pct = (full == 0) ? 5 : 1 + static_cast<int>((8 * done) / full);
-            if (pct > 9) pct = 9;
-            if (pct > meta->progress.load()) {
-                meta->progress = pct;
-                emit(false);
-            }
-        });
-    if (meta->stop_requested.load()) { finish("stopped", ""); return; }
-    if (cands.empty()) {
-        finish("failed", "no surviving $MFT found on the disk");
+    bool need_mft_search = true;
+    std::vector<FatVolume> fat_vols = detect_mbr_fat_volumes(reader, &need_mft_search);
+
+    std::vector<RawMftCandidate> cands;
+    if (need_mft_search) {
+        // Locate every surviving $MFT record-0 across the WHOLE disk (not just
+        // the first 16 GiB — a multi-partition disk has one $MFT per volume,
+        // each ~3 GiB into its own volume). Report search progress [1, 9]%.
+        cands = scan_mft_candidates(
+            reader, full, &meta->stop_requested,
+            [&](uint64_t done) {
+                check_pause();
+                if (meta->stop_requested.load()) return;
+                int pct = (full == 0) ? 5 : 1 + static_cast<int>((8 * done) / full);
+                if (pct > 9) pct = 9;
+                if (pct > meta->progress.load()) {
+                    meta->progress = pct;
+                    emit(false);
+                }
+            });
+        if (meta->stop_requested.load()) { finish("stopped", ""); return; }
+    }
+
+    if (cands.empty() && fat_vols.empty()) {
+        finish("failed", "no recognizable filesystem found on the disk");
         return;
     }
 
@@ -1339,25 +1582,37 @@ void Scanner::raw_scan_all_worker(std::shared_ptr<ScanTask> meta) {
         vols.push_back({cand.offset, cs, vs, tr});
     }
 
-    if (vols.empty()) {
-        finish("failed", "no self-consistent NTFS volume found");
+    if (vols.empty() && fat_vols.empty()) {
+        finish("failed", "no recognizable filesystem found on the disk");
         return;
     }
-
-    std::sort(vols.begin(), vols.end(), [](const Volume& a, const Volume& b) {
-        return a.volume_start < b.volume_start;
-    });
 
     meta->progress = 10;
     emit(true);
 
-    // 3. Spawn one scan task per volume. Each gets a deterministic id/save name
-    //    ("disk<N>_v<K>") so a restart reloads them the same way, and so a
-    //    re-scan cleanly replaces the previous result.
+    // 3. Spawn one scan task per volume (NTFS + FAT/exFAT interleaved by
+    //    position). Each gets a deterministic id/save name ("disk<N>_v<K>") so a
+    //    restart reloads them the same way, and so a re-scan cleanly replaces the
+    //    previous result.
+    struct Spawn {
+        uint64_t volume_start;
+        uint64_t cluster_size;
+        FsType fs;
+        uint64_t mft_offset;
+    };
+    std::vector<Spawn> spawns;
+    spawns.reserve(vols.size() + fat_vols.size());
+    for (const auto& v : vols)
+        spawns.push_back({v.volume_start, v.cluster_size, FsType::NTFS, v.mft_offset});
+    for (const auto& f : fat_vols)
+        spawns.push_back({f.volume_start, f.cluster_size, f.fs, 0});
+    std::sort(spawns.begin(), spawns.end(),
+              [](const Spawn& a, const Spawn& b) { return a.volume_start < b.volume_start; });
+
     std::vector<std::shared_ptr<ScanTask>> subs;
     std::vector<std::string> part_ids;
-    part_ids.reserve(vols.size());
-    for (size_t k = 0; k < vols.size(); k++) {
+    part_ids.reserve(spawns.size());
+    for (size_t k = 0; k < spawns.size(); k++) {
         auto t = std::make_shared<ScanTask>();
         t->id = "disk" + std::to_string(disk) + "_v" + std::to_string(k);
         part_ids.push_back(t->id);
@@ -1368,7 +1623,10 @@ void Scanner::raw_scan_all_worker(std::shared_ptr<ScanTask> meta) {
         t->mode = "raw";
         t->disk_number = disk;
         t->raw = true;
-        t->mft_offset_hint = vols[k].mft_offset;
+        t->fs_type = spawns[k].fs;
+        t->cluster_size = spawns[k].cluster_size;
+        t->volume_start = spawns[k].volume_start;
+        t->mft_offset_hint = (spawns[k].fs == FsType::NTFS) ? spawns[k].mft_offset : 0;
         t->status = "running";
         t->progress = 0;
 
@@ -1378,7 +1636,10 @@ void Scanner::raw_scan_all_worker(std::shared_ptr<ScanTask> meta) {
         }
         {
             std::lock_guard<std::mutex> lock(threads_mutex_);
-            threads_.emplace_back(&Scanner::raw_scan_worker, this, t);
+            if (spawns[k].fs == FsType::NTFS)
+                threads_.emplace_back(&Scanner::raw_scan_worker, this, t);
+            else
+                threads_.emplace_back(&Scanner::fat_scan_worker, this, t);
         }
         subs.push_back(t);
     }
@@ -1458,7 +1719,7 @@ void Scanner::raw_scan_all_worker(std::shared_ptr<ScanTask> meta) {
     // Record this whole-disk scan as one session, keyed by the disk's serial
     // number (same serial → replace the previous record). Done even if a single
     // partition failed, so the user still sees the other completed partitions.
-    record_session(serial, disk, part_ids);
+    record_session(serial, model, full, disk, part_ids);
 
     finish(any_failed ? "failed" : "completed",
            any_failed ? "one or more partitions failed to scan" : "");

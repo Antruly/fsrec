@@ -1,5 +1,6 @@
 #include "mft_parser.h"
 
+#include <algorithm>
 #include <cstring>
 
 #include "data_run.h"
@@ -16,6 +17,101 @@ static inline uint32_t le32(const uint8_t* p) {
 }
 static inline uint64_t le64(const uint8_t* p) {
     return static_cast<uint64_t>(le32(p)) | (static_cast<uint64_t>(le32(p + 4)) << 32);
+}
+
+// One entry in a resident $ATTRIBUTE_LIST value.
+struct AttrListEntry {
+    uint32_t type = 0;
+    uint8_t  name_len = 0;
+    uint64_t start_vcn = 0;
+    uint64_t mft_ref = 0;   // low 48 bits = MFT record number
+};
+
+// Parse a resident $ATTRIBUTE_LIST value into its entries.
+static std::vector<AttrListEntry> parse_attribute_list(const uint8_t* v, uint32_t vlen) {
+    std::vector<AttrListEntry> out;
+    const uint8_t* end = v + vlen;
+    const uint8_t* e = v;
+    while (e + 0x18 <= end) {
+        uint32_t type = le32(e + 0x00);
+        uint16_t elen = le16(e + 0x04);
+        if (elen < 0x18 || e + elen > end) break;
+        AttrListEntry a;
+        a.type = type;
+        a.name_len = e[0x06];
+        a.start_vcn = le64(e + 0x08);
+        a.mft_ref = le64(e + 0x10) & 0x0000FFFFFFFFFFFFULL;
+        out.push_back(a);
+        e += elen;
+    }
+    return out;
+}
+
+// Extract the unnamed, non-resident $DATA run list from a USA-fixed record.
+static bool extract_data_runs(const std::vector<uint8_t>& buffer, std::vector<DataRun>& runs) {
+    const uint8_t* rec = buffer.data();
+    size_t rec_size = buffer.size();
+    if (rec_size < 0x30 || std::memcmp(rec, "FILE", 4) != 0) return false;
+    uint16_t first_attr = le16(rec + 0x14);
+    if (first_attr == 0 || first_attr >= rec_size) return false;
+
+    size_t attr_off = first_attr;
+    while (attr_off + 8 <= rec_size) {
+        uint32_t type = le32(rec + attr_off);
+        if (type == AT_END || type == 0x00000000) break;
+        uint32_t length = le32(rec + attr_off + 0x04);
+        if (length < 8 || attr_off + length > rec_size) break;
+        uint8_t non_resident = rec[attr_off + 0x08];
+        uint8_t name_len = rec[attr_off + 0x09];
+        if (type == AT_DATA && non_resident && name_len == 0) {
+            uint16_t run_off = le16(rec + attr_off + 0x20);
+            if (run_off > 0 && attr_off + run_off < attr_off + length) {
+                return DataRunParser::parse(rec + attr_off + run_off,
+                                            attr_off + length - (attr_off + run_off),
+                                            runs);
+            }
+        }
+        attr_off += length;
+    }
+    return false;
+}
+
+// Reassemble a $DATA run list split across extension records. `node.data_runs`
+// already holds the base extent (lowest VCN 0, absolute LCNs); extension extents
+// referenced by the attribute list are read via `ext_reader` and appended in
+// ascending start-VCN order. The run list is one continuous stream, so a
+// fragment's first offset is a delta relative to the previous fragment's last
+// LCN: add `prev_lcn` to every non-sparse run (sparse runs have no LCN).
+static void merge_extension_data_runs(FileNode& node, uint64_t base_number,
+                                      const std::vector<AttrListEntry>& entries,
+                                      const std::function<bool(uint64_t, std::vector<uint8_t>&)>& ext_reader) {
+    std::vector<AttrListEntry> exts;
+    for (const auto& e : entries)
+        if (e.type == AT_DATA && e.name_len == 0 && e.mft_ref != base_number)
+            exts.push_back(e);
+    if (exts.empty()) return;
+
+    std::sort(exts.begin(), exts.end(),
+              [](const AttrListEntry& a, const AttrListEntry& b) { return a.start_vcn < b.start_vcn; });
+
+    int64_t prev_lcn = 0;
+    for (const auto& r : node.data_runs) if (!r.sparse) prev_lcn = r.lcn;
+
+    for (const auto& e : exts) {
+        std::vector<uint8_t> ext_buf;
+        if (!ext_reader(e.mft_ref, ext_buf)) continue;
+        std::vector<DataRun> frag;
+        if (!extract_data_runs(ext_buf, frag)) continue;
+        for (auto& r : frag) {
+            if (!r.sparse) {
+                r.lcn += prev_lcn;
+                prev_lcn = r.lcn;
+            }
+        }
+        node.data_runs.insert(node.data_runs.end(), frag.begin(), frag.end());
+    }
+
+    if (!node.data_runs.empty()) node.has_data = true;
 }
 
 uint64_t MftParser::record_offset(uint64_t mft_number) const {
@@ -51,7 +147,8 @@ void MftParser::apply_usa_fixup(std::vector<uint8_t>& buffer, uint32_t sector_si
     (void)usn;
 }
 
-bool MftParser::parse_record(const std::vector<uint8_t>& buffer, FileNode& node) {
+bool MftParser::parse_record(const std::vector<uint8_t>& buffer, FileNode& node,
+                             const std::function<bool(uint64_t, std::vector<uint8_t>&)>& ext_reader) {
     if (buffer.size() < 0x30) return false;
     if (std::memcmp(buffer.data(), "FILE", 4) != 0) return false;
 
@@ -78,6 +175,8 @@ bool MftParser::parse_record(const std::vector<uint8_t>& buffer, FileNode& node)
     bool has_file_name = false;
     uint8_t best_ns = 0xFF;
     bool saw_data = false;
+    std::vector<AttrListEntry> attr_entries;
+    bool saw_attribute_list = false;
 
     size_t attr_off = first_attr;
     while (attr_off + 8 <= rec_size) {
@@ -138,6 +237,13 @@ bool MftParser::parse_record(const std::vector<uint8_t>& buffer, FileNode& node)
                     }
                 }
             }
+        } else if (type == AT_ATTRIBUTE_LIST && !non_resident) {
+            uint32_t vlen = le32(rec + attr_off + 0x10);
+            uint16_t voff = le16(rec + attr_off + 0x14);
+            if (attr_off + voff + vlen <= rec_size) {
+                attr_entries = parse_attribute_list(rec + attr_off + voff, vlen);
+                saw_attribute_list = true;
+            }
         } else if (type == AT_DATA) {
             if (non_resident) {
                 uint16_t run_off = le16(rec + attr_off + 0x20);
@@ -174,6 +280,12 @@ bool MftParser::parse_record(const std::vector<uint8_t>& buffer, FileNode& node)
     }
 
     if (!has_file_name) return false;
+
+    // Follow the $ATTRIBUTE_LIST to reassemble a $DATA run list split across
+    // extension records (only when the caller supplied an extension reader).
+    if (ext_reader && saw_attribute_list && !attr_entries.empty()) {
+        merge_extension_data_runs(node, mft_number, attr_entries, ext_reader);
+    }
 
     // Recoverable when the $DATA stream parsed with actual content.
     if (node.resident) {

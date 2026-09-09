@@ -27,6 +27,7 @@ void DiskReader::close() {
     }
     base_offset_ = 0;
     physical_size_ = 0;
+    cluster_size_override_ = 0;
 }
 
 bool DiskReader::open(const std::string& drive, std::string* error) {
@@ -197,8 +198,8 @@ bool DiskReader::read_sector(uint64_t sector, void* buffer) {
 }
 
 bool DiskReader::read_cluster(uint64_t cluster, void* buffer) {
-    uint64_t off = cluster * boot_.cluster_size();
-    return read_aligned(off, buffer, static_cast<size_t>(boot_.cluster_size()));
+    uint64_t off = cluster * cluster_size();
+    return read_aligned(off, buffer, static_cast<size_t>(cluster_size()));
 }
 
 } // namespace recovery

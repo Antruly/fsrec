@@ -2,12 +2,12 @@
 
 # 🛠️ fsrec
 
-**从零实现的 NTFS 数据恢复工具**
+**从零实现的数据恢复工具（NTFS · FAT · exFAT）**
 
-通过 Windows 原始磁盘读取接口解析 NTFS 文件系统、重建目录树，支持扫描、搜索与**选择性恢复**已删除或误格式化后仍存留的文件。
+通过 Windows 原始磁盘读取接口解析 NTFS / FAT / exFAT 文件系统、重建目录树，支持扫描、搜索与**选择性恢复**已删除或误格式化后仍存留的文件。
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.0.8-brightgreen.svg)](https://github.com/Antruly/fsrec/releases)
+[![Version](https://img.shields.io/badge/version-1.0.9-brightgreen.svg)](https://github.com/Antruly/fsrec/releases)
 [![Language](https://img.shields.io/badge/language-C%2B%2B17-00599C.svg)](#)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-lightgrey.svg)](#)
 
@@ -19,10 +19,11 @@
 
 ## 📖 简介
 
-**fsrec** 是一款面向 Windows 的 NTFS 数据恢复工具。它不依赖任何第三方恢复引擎，而是直接从 NTFS
-底层数据结构出发——解析引导扇区（BPB）、主文件表（`$MFT`）与数据运行（Data Run），在内存中重建
-完整的目录树。你可以像浏览普通文件一样浏览那些已被删除、被清空回收站，甚至在分区被误格式化后
-仍残留在磁盘上的文件，并**按原目录结构**把它们恢复到另一块磁盘。
+**fsrec** 是一款面向 Windows 的数据恢复工具，支持 **NTFS / FAT12 / FAT16 / FAT32 / exFAT** 文件系统。
+它不依赖任何第三方恢复引擎，而是直接从文件系统底层数据结构出发——解析引导扇区（BPB）、NTFS
+主文件表（`$MFT`）、FAT 目录项与数据运行（Data Run），在内存中重建完整的目录树。你可以像浏览
+普通文件一样浏览那些已被删除、被清空回收站，甚至在分区被误格式化后仍残留在磁盘上的文件，
+并**按原目录结构**把它们恢复到另一块磁盘。
 
 | 维度 | 说明 |
 |------|------|
@@ -40,7 +41,8 @@
 - 📚 **`$MFT` 解析** — 遍历文件记录，USA 修复，提取 `$STANDARD_INFORMATION` / `$FILE_NAME` / `$DATA`
 - 🧩 **数据运行解析** — resident / non-resident 属性，含稀疏簇处理
 - 🌲 **目录树重建** — 依据父引用与文件名（含 `$MFT` 编号兜底）构建完整树
-- 🗂️ **分区级扫描** — `raw_scan_all` 遍历整盘，定位每个 NTFS 分区并分别缓存
+- 🗂️ **分区级扫描** — `raw_scan_all` 遍历整盘，定位每个分区（NTFS 经 `$MFT` 搜索，FAT/exFAT 经 MBR 分区表）并分别缓存
+- 💾 **多文件系统** — 同时解析 FAT12/16/32 与 exFAT（BPB / 目录项 / FAT 链 / exFAT 文件+流+名称项）
 - 🔎 **搜索过滤** — 前端按名称 / 类型快速筛选
 - ♻️ **选择性恢复** — 保留原目录结构写入输出目录，同名文件自动改名，支持**暂停 / 继续 / 停止**
 - 📡 **实时进度** — WebSocket 推送总体进度 + 当前文件 + 每文件字节进度；刷新页面后自动恢复进行中的任务
@@ -53,7 +55,7 @@
 
 ### 直接下载（推荐）
 
-从 [Releases](https://github.com/Antruly/fsrec/releases) 下载 `fsrec_Setup_1.0.8.exe`，
+从 [Releases](https://github.com/Antruly/fsrec/releases) 下载 `fsrec_Setup_1.0.9.exe`，
 双击安装（全中文向导）。安装完成后双击桌面 / 开始菜单的 **fsrec** 图标：
 
 1. 自动触发 UAC 提权（`requireAdministrator` 清单）
@@ -89,7 +91,7 @@ recovery_server.exe --no-browser   # 不自动打开浏览器
 
 ```powershell
 curl http://localhost:8080/ping
-# → {"status":"ok","name":"fsrec","version":"1.0.8"}
+# → {"status":"ok","name":"fsrec","version":"1.0.9"}
 ```
 
 ---
@@ -126,6 +128,7 @@ fsrec/
 │   ├── main.cpp                 # 入口：管理员检测 + 参数解析 + 启动服务 + 自动开浏览器
 │   ├── include/                 # types.h / util.h / util.cpp / version.h
 │   ├── ntfs/                    # disk_reader / boot_parser / data_run / mft_parser / tree_builder
+│   ├── fat/                     # fat.cpp / fat.h — FAT12/16/32 + exFAT 解析（BPB / 目录 / FAT 链）
 │   ├── recovery/                # scanner（后台扫描）/ restorer（后台恢复）
 │   └── http/server.*            # 路由 + WebSocket 推送中心
 ├── resources/
@@ -157,7 +160,7 @@ fsrec/
 powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
 ```
 
-产物输出到 `release\fsrec_Setup_1.0.8.exe`（全中文安装向导，安装后生成开始菜单 / 桌面快捷方式，
+产物输出到 `release\fsrec_Setup_1.0.9.exe`（全中文安装向导，安装后生成开始菜单 / 桌面快捷方式，
 双击 exe 自动提权并打开浏览器）。
 
 ---

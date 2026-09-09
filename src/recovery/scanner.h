@@ -50,9 +50,13 @@ struct ScanTask {
 
     // Raw-scan metadata (guarded by mtx).
     std::vector<RawMftCandidate> candidates;
-    uint64_t cluster_size = 0;      // detected NTFS cluster size (raw mode)
+    uint64_t cluster_size = 0;      // detected cluster size in bytes (raw mode)
     uint64_t volume_start = 0;      // detected volume start byte offset (raw mode)
     uint64_t mft_records_total = 0; // total $MFT records (from record 0 $DATA)
+
+    // Filesystem family this volume was parsed as (NTFS / FAT12 / FAT16 /
+    // FAT32 / exFAT). FAT volumes set this; NTFS volumes default to NTFS.
+    FsType fs_type = FsType::NTFS;
 
     // True when this task was reconstructed from a saved scan file on startup
     // (no re-scan needed); its id is deterministic ("disk<N>" or "disk<N>_v<K>").
@@ -80,6 +84,8 @@ struct ScanTask {
 struct ScanSession {
     std::string key;          // dedup key: serial, or "disk<N>" when serial unknown
     std::string serial;       // physical disk serial ("" if unknown)
+    std::string model;        // physical disk model / ProductId ("" if unknown)
+    uint64_t size = 0;        // physical disk byte size (0 if unknown)
     int  disk_number = -1;
     int64_t scanned_at = 0;   // unix seconds
     std::vector<std::string> partitions; // task ids "disk<N>_v<K>"
@@ -149,10 +155,16 @@ private:
     void raw_scan_worker(std::shared_ptr<ScanTask> task);
     void raw_scan_all_worker(std::shared_ptr<ScanTask> meta);
 
+    // Parse a FAT12/16/32 or exFAT volume whose start is `task->volume_start`;
+    // `task->fs_type` selects the family. Fills the result tree + counters and
+    // persists it like the NTFS raw_scan_worker.
+    void fat_scan_worker(std::shared_ptr<ScanTask> task);
+
     // Build + broadcast a scan progress snapshot (throttling is the caller's job).
     void emit_scan_progress(const std::shared_ptr<ScanTask>& task, const char* type);
 
-    void record_session(const std::string& serial, int disk,
+    void record_session(const std::string& serial, const std::string& model,
+                        uint64_t size, int disk,
                         const std::vector<std::string>& partitions);
     void load_sessions();
     void save_sessions();

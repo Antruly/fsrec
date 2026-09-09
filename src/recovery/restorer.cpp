@@ -229,10 +229,7 @@ void Restorer::recover_worker(std::shared_ptr<RecoverJob> job,
     if (raw) {
         if (!reader.open_physical(disk_number, &err)) { finish("failed", "open physical disk: " + err); return; }
         reader.set_base_offset(volume_start);
-        if (cluster_size >= 512) {
-            reader.boot().bytes_per_sector = 512;
-            reader.boot().sectors_per_cluster = static_cast<uint8_t>(cluster_size / 512);
-        }
+        if (cluster_size >= 512) reader.set_cluster_size(cluster_size);
     } else {
         if (!reader.open(task->drive, &err)) { finish("failed", "open volume: " + err); return; }
         if (!BootParser::parse(reader, &err)) { finish("failed", "parse boot sector: " + err); return; }
@@ -297,8 +294,12 @@ void Restorer::recover_worker(std::shared_ptr<RecoverJob> job,
         emit(true);
     };
 
-    const NTFSBootInfo& boot = reader.boot();
-    const uint64_t cluster_size_bytes = boot.cluster_size();
+    // Use the reader's override-aware cluster size. In raw mode boot_ may only
+    // hold the default 512-byte geometry, while the real volume cluster size
+    // (FAT/exFAT clusters can be 128 KiB, NTFS 512 B – 2 MiB) lives in the
+    // override set from the scan task. `read_cluster` uses the same override,
+    // so the buffer must match it to avoid over/under-reads.
+    const uint64_t cluster_size_bytes = reader.cluster_size();
     std::vector<uint8_t> cluster(cluster_size_bytes ? cluster_size_bytes : 4096);
     std::vector<uint8_t> zero(cluster.size(), 0);
 

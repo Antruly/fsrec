@@ -42,6 +42,15 @@ public:
     const NTFSBootInfo& boot() const { return boot_; }
     NTFSBootInfo& boot() { return boot_; }
 
+    // Cluster size (bytes) used by read_cluster. Defaults to the boot-sector
+    // derived value; set_cluster_size overrides it so a recovered volume with an
+    // arbitrary (non-512-multiple) cluster size — e.g. exFAT 128 KiB clusters —
+    // reads correctly during recovery.
+    void set_cluster_size(uint64_t sz) { cluster_size_override_ = sz; }
+    uint64_t cluster_size() const {
+        return cluster_size_override_ ? cluster_size_override_ : boot_.cluster_size();
+    }
+
     // Byte offset added to every read. For a drive-letter volume this is 0;
     // for a carved volume on a physical disk it is the volume's start byte.
     void set_base_offset(uint64_t base) { base_offset_ = base; }
@@ -63,6 +72,7 @@ private:
     std::string drive_;
     uint64_t base_offset_ = 0;
     uint64_t physical_size_ = 0;
+    uint64_t cluster_size_override_ = 0;
 };
 
 // Cumulative raw bytes actually read across every DiskReader in this process

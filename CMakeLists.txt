@@ -28,6 +28,7 @@ add_executable(recovery_server
     src/ntfs/data_run.cpp
     src/ntfs/mft_parser.cpp
     src/ntfs/tree_builder.cpp
+    src/fat/fat.cpp
     src/recovery/scanner.cpp
     src/recovery/restorer.cpp
     src/include/util.cpp
