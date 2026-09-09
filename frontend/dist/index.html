@@ -197,9 +197,13 @@
 
   /* ---- saved scans ---- */
   .saved-list { display: flex; flex-direction: column; gap: 8px; }
-  .saved-item { display: flex; align-items: center; gap: 14px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; }
-  .saved-item .info { font-size: 13px; flex: 1; min-width: 0; }
-  .saved-item .info b { font-weight: 700; }
+  .saved-item { display: flex; flex-direction: column; gap: 10px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; }
+  .saved-head { display: flex; align-items: center; gap: 14px; }
+  .saved-head .info, .saved-row .info { font-size: 13px; flex: 1; min-width: 0; }
+  .saved-head .info b, .saved-row .info b { font-weight: 700; }
+  .saved-actions { display: flex; gap: 8px; align-items: center; flex: 0 0 auto; }
+  .saved-sub { display: flex; flex-direction: column; gap: 6px; }
+  .saved-row { display: flex; align-items: center; gap: 14px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; }
 
   /* ---- tree ---- */
   .tree-toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
@@ -321,7 +325,7 @@
     <div class="topbar-inner">
       <div class="logo">🛠️</div>
       <div class="brand">
-        <h1>fsrec <span class="ver">v1.0.5</span></h1>
+        <h1>fsrec <span class="ver">v1.0.6</span></h1>
         <p class="sub">NTFS 数据恢复 · 误格式化 / 覆盖的硬盘 · 只读扫描定位 → 手动确认恢复</p>
       </div>
       <div class="topbar-right">
@@ -453,7 +457,7 @@
 
   <footer class="footer">
     <div class="footer-inner">
-      <span>fsrec <span class="ver">v1.0.5</span> · NTFS 数据恢复工具</span>
+      <span>fsrec <span class="ver">v1.0.6</span> · NTFS 数据恢复工具</span>
       <span class="footer-sep">·</span>
       <span>扫描阶段只读，绝不写入源盘；恢复需手动确认</span>
       <span class="footer-sep">·</span>
@@ -509,7 +513,7 @@
       <div class="modal-head">关于 fsrec <button class="modal-x" id="closeAbout">✕</button></div>
       <div class="about-body">
         <div class="about-logo">🛠️</div>
-        <h2 class="about-title">fsrec <span class="ver">v1.0.5</span></h2>
+        <h2 class="about-title">fsrec <span class="ver">v1.0.6</span></h2>
         <p class="about-tagline">NTFS 数据恢复工具</p>
         <p class="about-desc">通过 Windows 原始磁盘读取接口解析 NTFS 文件系统、重建目录树，帮助你在硬盘被误格式化、分区被覆盖或文件被删除后，浏览并恢复文件与目录结构。</p>
         <div class="about-stack">
@@ -830,7 +834,9 @@ async function loadSavedScans() {
     const diskLabel = diskList.find(d => d.disk_number === s.disk_number);
     const item = document.createElement('div');
     item.className = 'saved-item';
-    item.style.alignItems = 'flex-start';
+
+    const head = document.createElement('div');
+    head.className = 'saved-head';
 
     const info = document.createElement('span');
     info.className = 'info';
@@ -843,10 +849,7 @@ async function loadSavedScans() {
       `<span class="muted"> · 扫描于 ${timeStr} · ${s.partitions.length} 个分区</span>`;
 
     const actions = document.createElement('div');
-    actions.style.display = 'flex';
-    actions.style.gap = '8px';
-    actions.style.alignItems = 'center';
-    actions.style.flex = '0 0 auto';
+    actions.className = 'saved-actions';
     const delBtn = document.createElement('button');
     delBtn.className = 'btn ghost';
     delBtn.textContent = '🗑 删除';
@@ -854,23 +857,21 @@ async function loadSavedScans() {
     delBtn.addEventListener('click', () => deleteScan(s.key, s.partitions));
     actions.appendChild(delBtn);
 
-    item.appendChild(info);
-    item.appendChild(actions);
+    head.appendChild(info);
+    head.appendChild(actions);
+    item.appendChild(head);
     wrap.appendChild(item);
 
     // Nested, expandable partition list for this scan session.
     if (s.partitions && s.partitions.length) {
       const sub = document.createElement('div');
-      sub.style.width = '100%';
-      sub.style.marginTop = '10px';
+      sub.className = 'saved-sub';
       for (const p of s.partitions) {
         const m = /^disk(\d+)_v(\d+)$/.exec(p.task_id);
         const volLabel = m ? `分区 ${Number(m[2]) + 1}` : '分区';
         const offLabel = p.volume_start ? ` · 偏移 ${fmtBytes(p.volume_start)}` : '';
         const row = document.createElement('div');
-        row.className = 'saved-item';
-        row.style.marginTop = '6px';
-        row.style.borderColor = 'var(--border)';
+        row.className = 'saved-row';
         const pinfo = document.createElement('span');
         pinfo.className = 'info';
         pinfo.innerHTML =
