@@ -4,4 +4,4 @@
 // Inno Setup script (packaging/fsrec.iss). Keep all three in sync.
 
 #define FSREC_NAME "fsrec"
-#define FSREC_VERSION "1.0.10"
+#define FSREC_VERSION "1.0.11"

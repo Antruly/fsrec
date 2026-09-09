@@ -1,6 +1,7 @@
 #include "scanner.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -27,6 +28,12 @@ namespace recovery {
 namespace {
 
 using json = nlohmann::json;
+
+// Disk-identity helpers (defined further below; forward-declared because
+// save_scan_file uses disk_token before its definition).
+bool serial_is_zero(const std::string& s);
+std::string disk_token(const std::string& serial, const std::string& model,
+                       uint64_t size, int disk_number);
 
 // ---------------------------------------------------------------------------
 // Persistence: serialize/deserialize the full result tree (including the data
@@ -125,8 +132,8 @@ FileNodePtr deserialize_node(const json& j) {
     return node;
 }
 
-// Write a completed raw scan to data_dir/scan_disk<N>.json so it survives a
-// restart. Returns false (without throwing) on any I/O error.
+// Write a completed raw scan to data_dir/scan_<disk-token>.json so it survives
+// a restart. Returns false (without throwing) on any I/O error.
 bool save_scan_file(const std::shared_ptr<ScanTask>& task, const std::string& data_dir) {
     if (task->disk_number < 0 || data_dir.empty()) return false;
     try {
@@ -168,7 +175,7 @@ bool save_scan_file(const std::shared_ptr<ScanTask>& task, const std::string& da
         std::error_code ec;
         fs::create_directories(dir, ec);
         std::string stem = task->save_name.empty()
-                               ? ("scan_disk" + std::to_string(task->disk_number))
+                               ? ("scan_" + disk_token(task->serial, task->model, task->disk_size, task->disk_number))
                                : task->save_name;
         fs::path file = dir / (stem + ".json");
         // Write to a temp file then rename, so a crash mid-write never leaves a
@@ -236,6 +243,44 @@ bool read_disk_model_serial(int disk_number, std::string& model,
     }
     CloseHandle(h);
     return true;
+}
+
+// True when a serial is empty or all-zero — unusable as a stable disk identity.
+bool serial_is_zero(const std::string& s) {
+    return s.empty() || s.find_first_not_of('0') == std::string::npos;
+}
+
+// Build a filesystem-safe, stable token identifying one physical disk, used to
+// name persisted scan files so two different disks sharing a \\.\PhysicalDriveN
+// slot never overwrite each other's cache. Prefers the sanitized serial; falls
+// back to sanitized model + byte size; and finally to "disk<N>". Never empty.
+std::string disk_token(const std::string& serial, const std::string& model,
+                       uint64_t size, int disk_number) {
+    auto sanitize = [](const std::string& s) -> std::string {
+        std::string out;
+        for (unsigned char c : s)
+            out.push_back(std::isalnum(c) ? static_cast<char>(c) : '_');
+        std::string r;
+        for (char c : out) {
+            if (c == '_') {
+                if (!r.empty() && r.back() != '_') r.push_back(c);
+            } else {
+                r.push_back(c);
+            }
+        }
+        while (!r.empty() && r.back() == '_') r.pop_back();
+        if (r.size() > 64) r.resize(64);
+        while (!r.empty() && r.back() == '_') r.pop_back();
+        return r;
+    };
+
+    if (!serial_is_zero(serial)) {
+        std::string t = sanitize(serial);
+        if (!t.empty()) return t;
+    }
+    std::string m = sanitize(model);
+    if (!m.empty()) return m + "_" + std::to_string(size);
+    return "disk" + std::to_string(disk_number);
 }
 
 // Sentinel returned by an offset provider to stop record iteration.
@@ -570,6 +615,7 @@ std::vector<FatVolume> detect_mbr_fat_volumes(DiskReader& reader, bool* need_mft
     }
 
     bool any_partition = false;
+    uint64_t max_end_bytes = 0;
     for (int i = 0; i < 4; i++) {
         const uint8_t* e = s0.data() + 0x1BE + i * 16;
         uint8_t type = e[4];
@@ -577,6 +623,8 @@ std::vector<FatVolume> detect_mbr_fat_volumes(DiskReader& reader, bool* need_mft
         uint32_t sectors = le32(e + 12);
         if (sectors == 0 || start_lba == 0) continue;
         any_partition = true;
+        uint64_t end_bytes = (static_cast<uint64_t>(start_lba) + sectors) * 512;
+        if (end_bytes > max_end_bytes) max_end_bytes = end_bytes;
 
         // GPT protective MBR — GPT partitions are not parsed yet.
         if (type == 0xEE) {
@@ -630,6 +678,13 @@ std::vector<FatVolume> detect_mbr_fat_volumes(DiskReader& reader, bool* need_mft
     // An MBR with zero usable partitions → fall back to the $MFT search.
     if (!any_partition) {
         if (need_mft_search) *need_mft_search = true;
+    } else if (need_mft_search && !*need_mft_search) {
+        // A "pure FAT" MBR can still hide lost NTFS volumes in the unallocated
+        // tail; run the $MFT search when the FAT partitions leave a meaningful
+        // gap (they don't cover ≥95% of the disk).
+        uint64_t disk_bytes = reader.physical_size();
+        if (disk_bytes > 0 && max_end_bytes < disk_bytes * 95 / 100)
+            *need_mft_search = true;
     }
     return out;
 }
@@ -680,6 +735,8 @@ std::string Scanner::start_raw_scan(int disk_number, uint64_t mft_offset_hint,
     task->mft_offset_hint = mft_offset_hint;
     task->save_name = save_name;
     read_disk_model_serial(disk_number, task->model, task->serial, &task->disk_size);
+    if (task->save_name.empty())
+        task->save_name = "scan_" + disk_token(task->serial, task->model, task->disk_size, disk_number);
     task->status = "running";
     task->progress = 0;
 
@@ -743,23 +800,24 @@ void Scanner::load_saved(const std::string& data_dir) {
     fs::path dir = fs::u8path(data_dir_);
     if (!fs::is_directory(dir, ec)) return;
 
-    // Load every "scan_disk<N>.json" and "scan_disk<N>_v<K>.json" file. The
-    // filename stem doubles as the deterministic task id ("disk<N>" /
-    // "disk<N>_v<K>"), so a saved scan is addressable across restarts.
+    // Load every "scan_<disk-token>.json" and "scan_<disk-token>_v<K>.json"
+    // file. The filename stem doubles as the deterministic task id, so a saved
+    // scan is addressable across restarts. (Older builds used "scan_disk<N>…";
+    // the "scan_" prefix matches both.)
     std::vector<fs::path> files;
     for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
         const auto& p = it->path();
         std::string stem = p.stem().string(); // "scan_disk1" or "scan_disk1_v0"
         if (p.extension() != ".json") continue;
-        if (stem.rfind("scan_disk", 0) != 0) continue;
+        if (stem.rfind("scan_", 0) != 0) continue;
         files.push_back(p);
     }
     std::sort(files.begin(), files.end());
 
     for (const auto& file : files) {
         std::string stem = file.stem().string();
-        std::string id = stem; // "scan_disk1_v0" → "disk1_v0"
-        id.erase(0, strlen("scan_")); // → "disk1_v0" / "disk1"
+        std::string id = stem; // "scan_<token>_v0" → "<token>_v0"
+        id.erase(0, strlen("scan_")); // → "<token>" / "<token>_v0"
 
         try {
             std::ifstream ifs(file, std::ios::binary);
@@ -1647,11 +1705,12 @@ void Scanner::raw_scan_all_worker(std::shared_ptr<ScanTask> meta) {
     std::vector<std::shared_ptr<ScanTask>> subs;
     std::vector<std::string> part_ids;
     part_ids.reserve(spawns.size());
+    std::string token = disk_token(serial, model, full, disk);
     for (size_t k = 0; k < spawns.size(); k++) {
         auto t = std::make_shared<ScanTask>();
-        t->id = "disk" + std::to_string(disk) + "_v" + std::to_string(k);
+        t->id = token + "_v" + std::to_string(k);
         part_ids.push_back(t->id);
-        t->save_name = "scan_disk" + std::to_string(disk) + "_v" + std::to_string(k);
+        t->save_name = "scan_" + token + "_v" + std::to_string(k);
         char path[64];
         snprintf(path, sizeof(path), "\\\\.\\PhysicalDrive%d", disk);
         t->drive = path;

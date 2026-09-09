@@ -332,7 +332,7 @@
     <div class="topbar-inner">
       <div class="logo">🛠️</div>
       <div class="brand">
-        <h1>fsrec <span class="ver">v1.0.10</span></h1>
+        <h1>fsrec <span class="ver">v1.0.11</span></h1>
         <p class="sub">数据恢复 · 误格式化 / 覆盖的硬盘 · 只读扫描定位 → 手动确认恢复</p>
       </div>
       <div class="topbar-right">
@@ -471,7 +471,7 @@
 
   <footer class="footer">
     <div class="footer-inner">
-      <span>fsrec <span class="ver">v1.0.10</span> · 数据恢复工具</span>
+      <span>fsrec <span class="ver">v1.0.11</span> · 数据恢复工具</span>
       <span class="footer-sep">·</span>
       <span>扫描阶段只读，绝不写入源盘；恢复需手动确认</span>
       <span class="footer-sep">·</span>
@@ -527,7 +527,7 @@
       <div class="modal-head">关于 fsrec <button class="modal-x" id="closeAbout">✕</button></div>
       <div class="about-body">
         <div class="about-logo">🛠️</div>
-        <h2 class="about-title">fsrec <span class="ver">v1.0.10</span></h2>
+        <h2 class="about-title">fsrec <span class="ver">v1.0.11</span></h2>
         <p class="about-tagline">数据恢复工具</p>
         <p class="about-desc">通过 Windows 原始磁盘读取接口解析 NTFS / FAT / exFAT 文件系统、重建目录树，帮助你在硬盘被误格式化、分区被覆盖或文件被删除后，浏览并恢复文件与目录结构。</p>
         <div class="about-stack">
@@ -927,8 +927,8 @@ async function loadSavedScans() {
       const sub = document.createElement('div');
       sub.className = 'saved-sub';
       for (const p of s.partitions) {
-        const m = /^disk(\d+)_v(\d+)$/.exec(p.task_id);
-        const volLabel = m ? `分区 ${Number(m[2]) + 1}` : '分区';
+        const m = /_v(\d+)$/.exec(p.task_id);
+        const volLabel = m ? `分区 ${Number(m[1]) + 1}` : '分区';
         const offLabel = p.volume_start ? ` · 偏移 ${fmtBytes(p.volume_start)}` : '';
         const fsLabel = p.fs ? ` · <span class="fs-chip">${esc(p.fs)}</span>` : '';
         const row = document.createElement('div');
