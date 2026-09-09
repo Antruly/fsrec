@@ -2,7 +2,7 @@
 ; 编译：ISCC.exe packaging\fsrec.iss   （或运行 scripts\build_release.ps1）
 
 #define MyAppName "fsrec"
-#define MyAppVersion "1.0.6"
+#define MyAppVersion "1.0.7"
 #define MyAppPublisher "fsrec"
 #define MyAppExeName "recovery_server.exe"
 
@@ -57,7 +57,7 @@ Name: "{group}\停止 fsrec"; Filename: "{app}\stop.bat"; WorkingDir: "{app}"; I
 Name: "{autodesktop}\fsrec"; Filename: "{app}\start.bat"; Tasks: desktopicon; WorkingDir: "{app}"; IconFilename: "{app}\fsrec.ico"
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--port {code:GetPort}"; Description: "立即启动 fsrec"; Flags: postinstall nowait skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--port {code:GetPort}"; Description: "立即启动 fsrec"; Flags: postinstall nowait skipifsilent runascurrentuser
 
 [Code]
 var
