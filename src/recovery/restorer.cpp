@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <condition_variable>
 #include <cstdio>
+#include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -87,6 +90,73 @@ void count_files(const FileNodePtr& n, uint64_t& total, uint64_t& bytes) {
     if (!n->is_directory) { total++; bytes += n->size; return; }
     for (const auto& c : n->children) count_files(c, total, bytes);
 }
+
+// A single-producer / single-consumer ring of buffers that pipelines source
+// reads ahead of destination writes during file recovery. The producer thread
+// reads chunk N+1 into a free buffer while the consumer thread writes chunk N,
+// so the read latency no longer adds to the write latency; throughput rises
+// from read+write serialized toward the slower disk's speed.
+class ReadPipeline {
+public:
+    struct Piece {
+        const char* data;  // owned buffer (slot) or the zero buffer (slot == -1)
+        size_t      len;   // bytes to write
+        int         slot;  // buffer index to release, or -1 for a zero piece
+    };
+
+    ReadPipeline(size_t slots, size_t chunk) : chunk_(chunk) {
+        buf_.resize(slots);
+        for (auto& b : buf_) b.resize(chunk);
+        for (int i = static_cast<int>(slots) - 1; i >= 0; --i) free_.push_back(i);
+    }
+
+    uint8_t* buffer(int slot) { return buf_[static_cast<size_t>(slot)].data(); }
+    size_t chunk_size() const { return chunk_; }
+
+    // Producer side.
+    int acquire() {  // a free buffer slot, or -1 when closed
+        std::unique_lock<std::mutex> lk(m_);
+        cv_free_.wait(lk, [&] { return !free_.empty() || closed_; });
+        if (closed_) return -1;
+        int s = free_.back(); free_.pop_back();
+        return s;
+    }
+    void publish(const Piece& p) {
+        std::unique_lock<std::mutex> lk(m_);
+        ready_.push_back(p);
+        cv_ready_.notify_one();
+    }
+    void close() {
+        std::unique_lock<std::mutex> lk(m_);
+        closed_ = true;
+        cv_ready_.notify_all();
+        cv_free_.notify_all();
+    }
+
+    // Consumer side. Returns false once the stream is drained and closed.
+    bool next(Piece* out) {
+        std::unique_lock<std::mutex> lk(m_);
+        cv_ready_.wait(lk, [&] { return !ready_.empty() || closed_; });
+        if (ready_.empty()) return false;
+        *out = ready_.front(); ready_.pop_front();
+        return true;
+    }
+    void release(int slot) {
+        if (slot < 0) return;
+        std::unique_lock<std::mutex> lk(m_);
+        free_.push_back(slot);
+        cv_free_.notify_one();
+    }
+
+private:
+    size_t chunk_;
+    std::vector<std::vector<uint8_t>> buf_;
+    std::mutex m_;
+    std::condition_variable cv_free_, cv_ready_;
+    std::vector<int> free_;
+    std::deque<Piece> ready_;
+    bool closed_ = false;
+};
 
 } // namespace
 
@@ -297,11 +367,18 @@ void Restorer::recover_worker(std::shared_ptr<RecoverJob> job,
     // Use the reader's override-aware cluster size. In raw mode boot_ may only
     // hold the default 512-byte geometry, while the real volume cluster size
     // (FAT/exFAT clusters can be 128 KiB, NTFS 512 B – 2 MiB) lives in the
-    // override set from the scan task. `read_cluster` uses the same override,
-    // so the buffer must match it to avoid over/under-reads.
+    // override set from the scan task.
     const uint64_t cluster_size_bytes = reader.cluster_size();
-    std::vector<uint8_t> cluster(cluster_size_bytes ? cluster_size_bytes : 4096);
-    std::vector<uint8_t> zero(cluster.size(), 0);
+    const uint64_t cs = cluster_size_bytes ? cluster_size_bytes : 4096;
+
+    // Batched contiguous reads: a synchronous, unbuffered 4 KiB read per cluster
+    // (NO_BUFFERING + SetFilePointerEx + ReadFile each time) caps recovery at
+    // ~30 MB/s on an SSD. Reading each data-run span in 4 MiB batches turns
+    // thousands of tiny reads into a handful of large sequential ones and lifts
+    // throughput to near the disk's sequential speed. The buffers are large
+    // enough to be page-aligned, satisfying NO_BUFFERING's sector alignment.
+    constexpr size_t CHUNK = 4u * 1024u * 1024u;  // 4 MiB read/write batches
+    std::vector<uint8_t> zeros(CHUNK, 0);
 
     // Recursive recovery. `rel` is the node's path relative to out_base.
     std::function<bool(const FileNodePtr&, const fs::path&)> recover_node;
@@ -334,12 +411,17 @@ void Restorer::recover_worker(std::shared_ptr<RecoverJob> job,
             target = file.parent_path() / (stem.wstring() + L"_" + std::to_wstring(suffix++) + ext.wstring());
         }
 
+        // Large output buffer so sequential writes turn into a few big
+        // WriteFile calls rather than many small ones (declared before ofs so
+        // it is destroyed after the stream).
+        std::vector<char> wbuf(8u * 1024u * 1024u);
         std::ofstream ofs(target, std::ios::binary);
         if (!ofs.is_open()) {
             job->failed_files.fetch_add(1);
             emit(true);
             return false;
         }
+        ofs.rdbuf()->pubsetbuf(wbuf.data(), static_cast<std::streamsize>(wbuf.size()));
 
         // Announce the current file and write its data with pause/stop checks.
         {
@@ -366,33 +448,98 @@ void Restorer::recover_worker(std::shared_ptr<RecoverJob> job,
                 job->current_bytes = node->resident_data.size();
             }
         } else if (!node->data_runs.empty()) {
-            for (const auto& run : node->data_runs) {
-                if (remaining == 0) break;
-                for (uint64_t c = 0; c < run.length && remaining > 0; c++) {
-                    wait_if_paused();
-                    if (job->stop_requested.load()) { ofs.close(); return false; }
+            // Flatten the file's data runs into contiguous read segments.
+            struct Seg { uint64_t off; uint64_t len; bool sparse; };
+            std::vector<Seg> segs;
+            {
+                uint64_t rem = node->size;
+                for (const auto& run : node->data_runs) {
+                    if (rem == 0) break;
+                    uint64_t rb = run.length * cs;
+                    uint64_t n = std::min<uint64_t>(rem, rb);
+                    if (n == 0) continue;
+                    segs.push_back({static_cast<uint64_t>(run.lcn) * cs, n, run.sparse});
+                    rem -= n;
+                }
+            }
 
-                    const uint8_t* src = zero.data();
-                    if (!run.sparse) {
-                        if (!reader.read_cluster(static_cast<uint64_t>(run.lcn) + c, cluster.data())) {
-                            src = zero.data(); // bad sector: write zeroes, keep going
+            uint64_t delivered = 0;
+
+            if (node->size <= CHUNK) {
+                // Small file (a single batch): read and write inline. A prefetch
+                // thread only pays off when the file spans multiple chunks.
+                std::vector<uint8_t> scratch(CHUNK);
+                for (const auto& seg : segs) {
+                    uint64_t off = seg.off;
+                    uint64_t left = seg.len;
+                    while (left > 0) {
+                        wait_if_paused();
+                        if (job->stop_requested.load()) { ok = false; break; }
+                        size_t step = left > CHUNK ? CHUNK : static_cast<size_t>(left);
+                        const char* src;
+                        if (seg.sparse) {
+                            src = reinterpret_cast<const char*>(zeros.data());
+                        } else if (reader.read(off, scratch.data(), step)) {
+                            src = reinterpret_cast<const char*>(scratch.data());
                         } else {
-                            src = cluster.data();
+                            src = reinterpret_cast<const char*>(zeros.data()); // bad sector -> zeroes
+                        }
+                        ofs.write(src, static_cast<std::streamsize>(step));
+                        if (!ofs.good()) { ok = false; break; }
+                        delivered += step;
+                        job->recovered_bytes.fetch_add(step);
+                        off += step;
+                        left -= step;
+                    }
+                    if (!ok) break;
+                }
+            } else {
+                // Pipeline reads ahead of writes: the producer reads chunk N+1
+                // while this thread writes chunk N, overlapping the two disks
+                // instead of paying read-latency + write-latency per chunk.
+                ReadPipeline pipe(3, CHUNK);
+                std::thread producer([&]() {
+                    for (const auto& seg : segs) {
+                        uint64_t off = seg.off;
+                        uint64_t left = seg.len;
+                        while (left > 0) {
+                            if (job->stop_requested.load()) { pipe.close(); return; }
+                            size_t step = left > CHUNK ? CHUNK : static_cast<size_t>(left);
+                            if (seg.sparse) {
+                                pipe.publish({reinterpret_cast<const char*>(zeros.data()), step, -1});
+                            } else {
+                                int slot = pipe.acquire();
+                                if (slot < 0) return;  // closed
+                                if (!reader.read(off, pipe.buffer(slot), step))
+                                    std::memset(pipe.buffer(slot), 0, step); // bad sector -> zeroes
+                                pipe.publish({reinterpret_cast<const char*>(pipe.buffer(slot)), step, slot});
+                            }
+                            off += step;
+                            left -= step;
                         }
                     }
-                    uint64_t to_write = std::min<uint64_t>(remaining, cluster_size_bytes ? cluster_size_bytes : 4096);
-                    ofs.write(reinterpret_cast<const char*>(src), static_cast<std::streamsize>(to_write));
-                    if (!ofs.good()) { ok = false; remaining = 0; break; }
-                    remaining -= to_write;
-                    job->recovered_bytes.fetch_add(to_write);
+                    pipe.close(); // end-of-stream
+                });
+
+                ReadPipeline::Piece p;
+                while (pipe.next(&p)) {
+                    wait_if_paused();
+                    if (job->stop_requested.load()) { pipe.close(); ok = false; break; }
+                    ofs.write(p.data, static_cast<std::streamsize>(p.len));
+                    if (!ofs.good()) { pipe.close(); ok = false; break; }
+                    pipe.release(p.slot);
+                    delivered += p.len;
+                    job->recovered_bytes.fetch_add(p.len);
                     {
                         std::lock_guard<std::mutex> lock(job->mtx);
-                        job->current_bytes = node->size - remaining;
+                        job->current_bytes = delivered;
                     }
                     emit(false);
                 }
-                if (!ok) break;
+                if (producer.joinable()) producer.join();
             }
+
+            if (delivered < node->size) ok = false;
         }
         ofs.close();
 
