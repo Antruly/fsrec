@@ -817,7 +817,8 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
                 json body = json::parse(req.body.to_string().empty() ? "{}" : req.body.to_string());
                 int disk = body.value("disk_number", -1);
                 if (disk < 0) { set_error(resp, uvcpp::http_status::BAD_REQUEST, "disk_number is required"); return; }
-                std::string id = scanner_.start_raw_scan_all(disk);
+                bool deep = body.value("deep", false);
+                std::string id = scanner_.start_raw_scan_all(disk, deep);
                 json out; out["task_id"] = id;
                 set_json(resp, uvcpp::http_status::OK, out.dump());
             } catch (const std::exception& e) {

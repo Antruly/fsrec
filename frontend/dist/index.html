@@ -178,6 +178,17 @@
   label.confirm input { margin-top: 2px; }
   label.confirm b { color: var(--red); }
 
+  .scan-mode { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 14px; }
+  .scan-mode .mode-opt {
+    display: inline-flex; align-items: flex-start; gap: 8px; cursor: pointer;
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+    background: var(--card); font-size: 13px;
+  }
+  .scan-mode .mode-opt.sel { border-color: var(--primary); }
+  .scan-mode .mode-opt input { margin-top: 2px; }
+  .scan-mode .mode-opt b { white-space: nowrap; }
+  .scan-mode .mode-hint { color: var(--muted); font-size: 12px; }
+
   /* ---- progress ---- */
   .progress-block { margin-top: 16px; }
   .progress { height: 8px; background: var(--border); border-radius: 20px; overflow: hidden; }
@@ -332,7 +343,7 @@
     <div class="topbar-inner">
       <div class="logo">🛠️</div>
       <div class="brand">
-        <h1>fsrec <span class="ver">v1.0.11</span></h1>
+        <h1>fsrec <span class="ver">v1.0.12</span></h1>
         <p class="sub">数据恢复 · 误格式化 / 覆盖的硬盘 · 只读扫描定位 → 手动确认恢复</p>
       </div>
       <div class="topbar-right">
@@ -393,6 +404,11 @@
         <input type="checkbox" id="confirm">
         <span>我已核对所选磁盘（<b>绝不选择磁盘 0 / 系统盘</b>），并明白本次为<b>只读扫描</b>，不会写入任何数据</span>
       </label>
+      <div class="scan-mode" id="scanMode">
+        <span style="color:var(--muted);font-size:13px">扫描模式：</span>
+        <label class="mode-opt sel"><input type="radio" name="scanMode" value="deep" checked> <span><b>深度扫描</b><br><span class="mode-hint">整盘逐区搜索 $MFT，能发现被格式化 / 覆盖后残留的 NTFS 分区（约 10–20 分钟）</span></span></label>
+        <label class="mode-opt"><input type="radio" name="scanMode" value="quick"> <span><b>快速扫描</b><br><span class="mode-hint">按当前分区表定位，跳过未发现分区的整盘搜索（约 3–10 分钟）</span></span></label>
+      </div>
       <div class="form-row" style="margin-top:14px">
         <button id="scanBtn" class="btn amber" disabled>🔍 只读扫描定位</button>
         <button id="scanPauseBtn" class="btn amber" disabled style="display:none">⏸ 暂停</button>
@@ -471,7 +487,7 @@
 
   <footer class="footer">
     <div class="footer-inner">
-      <span>fsrec <span class="ver">v1.0.11</span> · 数据恢复工具</span>
+      <span>fsrec <span class="ver">v1.0.12</span> · 数据恢复工具</span>
       <span class="footer-sep">·</span>
       <span>扫描阶段只读，绝不写入源盘；恢复需手动确认</span>
       <span class="footer-sep">·</span>
@@ -527,7 +543,7 @@
       <div class="modal-head">关于 fsrec <button class="modal-x" id="closeAbout">✕</button></div>
       <div class="about-body">
         <div class="about-logo">🛠️</div>
-        <h2 class="about-title">fsrec <span class="ver">v1.0.11</span></h2>
+        <h2 class="about-title">fsrec <span class="ver">v1.0.12</span></h2>
         <p class="about-tagline">数据恢复工具</p>
         <p class="about-desc">通过 Windows 原始磁盘读取接口解析 NTFS / FAT / exFAT 文件系统、重建目录树，帮助你在硬盘被误格式化、分区被覆盖或文件被删除后，浏览并恢复文件与目录结构。</p>
         <div class="about-stack">
@@ -976,6 +992,16 @@ function toggleScanEnabled() {
   $('scanBtn').disabled = !(selectedDiskNumber != null && $('confirm').checked);
 }
 $('confirm').addEventListener('change', toggleScanEnabled);
+function currentScanMode() {
+  const el = document.querySelector('input[name="scanMode"]:checked');
+  return el ? el.value : 'deep';
+}
+document.querySelectorAll('input[name="scanMode"]').forEach(r =>
+  r.addEventListener('change', () => {
+    document.querySelectorAll('.mode-opt').forEach(o => o.classList.remove('sel'));
+    if (r.checked && r.closest('.mode-opt')) r.closest('.mode-opt').classList.add('sel');
+  })
+);
 
 async function onScan() {
   if (selectedDiskNumber == null) return;
@@ -986,7 +1012,7 @@ async function onScan() {
   $('pct').textContent = '';
   $('stats').textContent = '正在扫描整盘、定位所有分区（$MFT / FAT / exFAT）…（约 3–10 分钟）';
   try {
-    const j = await apiPost('/api/raw_scan_all', { disk_number: selectedDiskNumber });
+    const j = await apiPost('/api/raw_scan_all', { disk_number: selectedDiskNumber, deep: currentScanMode() === 'deep' });
     currentScanTaskId = j.task_id;
     scanDiskNumber = selectedDiskNumber;
     setScanControls('running');

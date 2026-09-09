@@ -570,18 +570,23 @@ struct FatVolume {
 };
 
 // Locate FAT/exFAT volumes by reading the MBR partition table. NTFS partitions
-// are NOT added here — the $MFT record-0 search handles them — but their
-// presence is reported via `*need_mft_search` so the caller can skip the
-// expensive whole-disk $MFT scan when the disk is pure FAT/exFAT. GPT disks
-// (protective MBR type 0xEE) and extended partitions are not yet parsed; they
-// set `*need_mft_search` so the caller falls back to the $MFT search.
-std::vector<FatVolume> detect_mbr_fat_volumes(DiskReader& reader, bool* need_mft_search) {
+// are NOT added here — the $MFT record-0 search handles them.
+//
+// `*need_mft_search` reports whether the caller should also run the whole-disk
+// $MFT search:
+//   - deep mode: ALWAYS true — a FAT-only MBR (or a reformatted disk) can still
+//     hide lost NTFS volumes whose $MFT survives *underneath* the new FAT
+//     partitions (a fresh FAT format writes new metadata but never erases the
+//     old $MFT).
+//   - quick mode: false once the disk is (super)FAT/exFAT-only (superfloppy or a
+//     FAT-only MBR); true for NTFS / GPT / extended / unrecognized / unreadable.
+std::vector<FatVolume> detect_mbr_fat_volumes(DiskReader& reader, bool* need_mft_search, bool deep) {
     std::vector<FatVolume> out;
-    if (need_mft_search) *need_mft_search = false;
+    if (need_mft_search) *need_mft_search = deep;
 
     std::vector<uint8_t> s0(512);
     if (!reader.read(0, s0.data(), 512)) {
-        // Can't even read sector 0 → we know nothing; fall back to $MFT search.
+        // Can't even read sector 0 → we know nothing; run the $MFT search.
         if (need_mft_search) *need_mft_search = true;
         return out;
     }
@@ -600,22 +605,17 @@ std::vector<FatVolume> detect_mbr_fat_volumes(DiskReader& reader, bool* need_mft
             if (parse_fat_boot(s0.data(), fi)) fv.cluster_size = fi.cluster_size();
         }
         if (fv.cluster_size) out.push_back(fv);
-        return out;  // pure FAT superfloppy → no $MFT search
-    }
-    if (t0 == FsType::NTFS) {
-        // NTFS superfloppy (no partition table) → only the $MFT search finds it.
-        if (need_mft_search) *need_mft_search = true;
+        // quick: whole device is one FAT volume → skip $MFT; deep: keep searching.
+        if (need_mft_search) *need_mft_search = deep;
         return out;
     }
+    // NTFS superfloppy → only the $MFT search finds it.
+    if (t0 == FsType::NTFS) { if (need_mft_search) *need_mft_search = true; return out; }
+    // Unknown layout → safest to run the $MFT search.
+    if (le16(s0.data() + 510) != 0xAA55) { if (need_mft_search) *need_mft_search = true; return out; }
 
-    if (le16(s0.data() + 510) != 0xAA55) {
-        // Unknown layout → safest to run the $MFT search.
-        if (need_mft_search) *need_mft_search = true;
-        return out;
-    }
-
+    // MBR partition table.
     bool any_partition = false;
-    uint64_t max_end_bytes = 0;
     for (int i = 0; i < 4; i++) {
         const uint8_t* e = s0.data() + 0x1BE + i * 16;
         uint8_t type = e[4];
@@ -623,17 +623,10 @@ std::vector<FatVolume> detect_mbr_fat_volumes(DiskReader& reader, bool* need_mft
         uint32_t sectors = le32(e + 12);
         if (sectors == 0 || start_lba == 0) continue;
         any_partition = true;
-        uint64_t end_bytes = (static_cast<uint64_t>(start_lba) + sectors) * 512;
-        if (end_bytes > max_end_bytes) max_end_bytes = end_bytes;
 
-        // GPT protective MBR — GPT partitions are not parsed yet.
-        if (type == 0xEE) {
-            if (need_mft_search) *need_mft_search = true;
-            continue;
-        }
-
-        // Extended partition (logical volumes not parsed) → fall back.
-        if (type == 0x05 || type == 0x0F || type == 0x85) {
+        // GPT protective MBR / extended partition — not parsed here; the $MFT
+        // search covers whatever NTFS may be present.
+        if (type == 0xEE || type == 0x05 || type == 0x0F || type == 0x85) {
             if (need_mft_search) *need_mft_search = true;
             continue;
         }
@@ -642,12 +635,10 @@ std::vector<FatVolume> detect_mbr_fat_volumes(DiskReader& reader, bool* need_mft
         bool fat_type = (type == 0x01 || type == 0x04 || type == 0x06 ||
                          type == 0x0B || type == 0x0C || type == 0x0E ||
                          type == 0xEF);
-        // NTFS-capable types.
-        bool ntfs_type = (type == 0x07 || type == 0x17 || type == 0x27);
 
         std::vector<uint8_t> boot(512);
         if (!reader.read(static_cast<uint64_t>(start_lba) * 512, boot.data(), 512)) {
-            // Unreadable partition — can't rule out NTFS.
+            // Unreadable partition — can't rule out NTFS (unless it's a FAT type).
             if (!fat_type) { if (need_mft_search) *need_mft_search = true; }
             continue;
         }
@@ -670,21 +661,14 @@ std::vector<FatVolume> detect_mbr_fat_volumes(DiskReader& reader, bool* need_mft
             fv.fs = fs;
             out.push_back(fv);
         } else {
-            // NTFS (handled by $MFT search) or unrecognized → may need $MFT search.
+            // NTFS (handled by $MFT search) or unrecognized → run the $MFT search.
             if (need_mft_search) *need_mft_search = true;
         }
     }
 
-    // An MBR with zero usable partitions → fall back to the $MFT search.
+    // An MBR with zero usable partitions → run the $MFT search.
     if (!any_partition) {
         if (need_mft_search) *need_mft_search = true;
-    } else if (need_mft_search && !*need_mft_search) {
-        // A "pure FAT" MBR can still hide lost NTFS volumes in the unallocated
-        // tail; run the $MFT search when the FAT partitions leave a meaningful
-        // gap (they don't cover ≥95% of the disk).
-        uint64_t disk_bytes = reader.physical_size();
-        if (disk_bytes > 0 && max_end_bytes < disk_bytes * 95 / 100)
-            *need_mft_search = true;
     }
     return out;
 }
@@ -752,7 +736,7 @@ std::string Scanner::start_raw_scan(int disk_number, uint64_t mft_offset_hint,
     return task->id;
 }
 
-std::string Scanner::start_raw_scan_all(int disk_number) {
+std::string Scanner::start_raw_scan_all(int disk_number, bool deep) {
     auto meta = std::make_shared<ScanTask>();
     meta->id = make_id("scanall", counter_.fetch_add(1));
     char path[64];
@@ -761,6 +745,7 @@ std::string Scanner::start_raw_scan_all(int disk_number) {
     meta->mode = "raw";
     meta->disk_number = disk_number;
     meta->raw = true;
+    meta->deep = deep;
     meta->meta = true; // no result tree; aggregates progress of per-volume tasks
     meta->status = "running";
     meta->progress = 0;
@@ -1594,10 +1579,11 @@ void Scanner::raw_scan_all_worker(std::shared_ptr<ScanTask> meta) {
     read_disk_model_serial(disk, model, serial);
 
     // 1. Locate partitions. FAT/exFAT volumes come from the MBR partition table
-    //    (cheap: MBR + one boot sector per partition), so detect them FIRST and
-    //    only run the expensive whole-disk $MFT search when the disk may also
-    //    hold NTFS volumes. This makes a pure-FAT USB scan in seconds instead of
-    //    minutes. NTFS partitions stay on the $MFT record-0 search path below.
+    //    (cheap: MBR + one boot sector per partition); NTFS volumes come from the
+    //    whole-disk $MFT record-0 search below. The $MFT search always runs for a
+    //    partitioned disk — a FAT-only MBR can still hide lost/reformatted NTFS
+    //    volumes underneath the FAT partitions — and is only skipped for a
+    //    "superfloppy" (a single FAT/exFAT volume with no partition table).
     {
         std::lock_guard<std::mutex> lock(meta->mtx);
         meta->current_path = "正在定位分区 ($MFT / FAT / exFAT)…";
@@ -1606,7 +1592,7 @@ void Scanner::raw_scan_all_worker(std::shared_ptr<ScanTask> meta) {
     emit(true);
 
     bool need_mft_search = true;
-    std::vector<FatVolume> fat_vols = detect_mbr_fat_volumes(reader, &need_mft_search);
+    std::vector<FatVolume> fat_vols = detect_mbr_fat_volumes(reader, &need_mft_search, meta->deep);
 
     std::vector<RawMftCandidate> cands;
     if (need_mft_search) {

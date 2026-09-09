@@ -80,6 +80,11 @@ struct ScanTask {
     // /api/scans or persisted.
     bool meta = false;
 
+    // Whole-disk scan mode. true = deep: always run the full $MFT search so
+    // lost/reformatted NTFS volumes hiding under a FAT-only MBR are found.
+    // false = quick: skip the $MFT search once the disk is (super)FAT/exFAT-only.
+    bool deep = false;
+
     std::string status_snapshot() const {
         // status is only mutated under mtx; read atomically enough for UI.
         return status;
@@ -118,9 +123,11 @@ public:
 
     // Scan EVERY surviving NTFS volume on a physical disk. Discovers all
     // self-consistent $MFT record-0s across the whole disk, then spawns one
-    // scan task per volume (each persisted separately as "scan_disk<N>_v<K>").
+    // scan task per volume (each persisted separately as "scan_<token>_v<K>").
+    // `deep` controls whether the whole-disk $MFT search always runs (true) or
+    // is skipped once the disk is (super)FAT/exFAT-only (false, the fast path).
     // Returns the coordinator task id; poll it for aggregate progress.
-    std::string start_raw_scan_all(int disk_number);
+    std::string start_raw_scan_all(int disk_number, bool deep = false);
 
     std::shared_ptr<ScanTask> get_task(const std::string& id);
 
