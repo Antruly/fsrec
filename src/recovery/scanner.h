@@ -27,6 +27,15 @@ struct ScanTask {
     std::string mode;    // "quick" | "raw"
     int  disk_number = -1;      // >=0 for raw physical-disk scans
     bool raw = false;
+
+    // Physical-disk identity captured at scan time, used to verify — by serial,
+    // falling back to (model + size) — that the SAME disk is still attached
+    // before recovery. A reused \\.\PhysicalDriveN number must never cause files
+    // to be recovered onto/from a *different* disk that now occupies that slot.
+    std::string serial;         // physical disk serial ("" if unknown)
+    std::string model;          // physical disk model / ProductId ("" if unknown)
+    uint64_t disk_size = 0;     // physical disk byte size (0 if unknown)
+
     uint64_t mft_offset = 0;       // chosen $MFT record-0 byte offset (raw mode)
     uint64_t mft_offset_hint = 0;  // caller-supplied hint (0 = auto-detect)
 

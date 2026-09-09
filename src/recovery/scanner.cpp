@@ -151,6 +151,9 @@ bool save_scan_file(const std::shared_ptr<ScanTask>& task, const std::string& da
         json j;
         j["version"] = 1;
         j["disk_number"] = task->disk_number;
+        j["serial"] = task->serial;
+        j["model"] = task->model;
+        j["disk_size"] = task->disk_size;
         j["fs"] = fs_type_name(fs);
         j["mft_offset"] = mft_offset;
         j["cluster_size"] = cluster_size;
@@ -192,17 +195,27 @@ bool save_scan_file(const std::shared_ptr<ScanTask>& task, const std::string& da
 // ProductIdOffset) and serial (SerialNumberOffset). The serial is the strongest
 // key, but many disks / USB bridges report an all-zero serial; callers then
 // match by (model, size) so a reused \\.\PhysicalDriveN number never causes a
-// false "same disk" match. Returns false when the disk can't be opened.
+// false "same disk" match. Returns false when the disk can't be opened. When
+// `size_out` is non-null it is filled with the disk's byte size (0 on failure).
 bool read_disk_model_serial(int disk_number, std::string& model,
-                            std::string& serial) {
+                            std::string& serial, uint64_t* size_out = nullptr) {
     model.clear();
     serial.clear();
+    if (size_out) *size_out = 0;
 
     char path[64];
     snprintf(path, sizeof(path), "\\\\.\\PhysicalDrive%d", disk_number);
     HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                            nullptr, OPEN_EXISTING, 0, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
+
+    if (size_out) {
+        DWORD unused = 0;
+        GET_LENGTH_INFORMATION li{};
+        if (DeviceIoControl(h, IOCTL_DISK_GET_LENGTH_INFO, nullptr, 0,
+                            &li, sizeof(li), &unused, nullptr))
+            *size_out = static_cast<uint64_t>(li.Length.QuadPart);
+    }
 
     std::vector<uint8_t> buf(sizeof(STORAGE_DEVICE_DESCRIPTOR) + 512, 0);
     STORAGE_PROPERTY_QUERY spq{};
@@ -666,6 +679,7 @@ std::string Scanner::start_raw_scan(int disk_number, uint64_t mft_offset_hint,
     task->raw = true;
     task->mft_offset_hint = mft_offset_hint;
     task->save_name = save_name;
+    read_disk_model_serial(disk_number, task->model, task->serial, &task->disk_size);
     task->status = "running";
     task->progress = 0;
 
@@ -720,6 +734,10 @@ void Scanner::load_saved(const std::string& data_dir) {
     // Restore the scan-session index (data/scans.json) in addition to the
     // per-partition result trees loaded below.
     load_sessions();
+    // Snapshot so per-volume tasks below can backfill disk identity from their
+    // session (for scan files written by older versions that stored serial /
+    // model / size only in the session, not per-task).
+    std::vector<ScanSession> sessions = list_sessions();
 
     std::error_code ec;
     fs::path dir = fs::u8path(data_dir_);
@@ -769,6 +787,23 @@ void Scanner::load_saved(const std::string& data_dir) {
             task->cluster_size = j.value("cluster_size", static_cast<uint64_t>(0));
             task->volume_start = j.value("volume_start", static_cast<uint64_t>(0));
             task->mft_records_total = j.value("mft_records_total", static_cast<uint64_t>(0));
+            task->serial = j.value("serial", "");
+            task->model = j.value("model", "");
+            task->disk_size = j.value("disk_size", static_cast<uint64_t>(0));
+            // Backfill identity from the matching session when an older scan
+            // file didn't persist it per-task (otherwise recovery would be
+            // refused as "unverifiable" even though the session knows the disk).
+            if (task->serial.empty() && task->model.empty() && task->disk_size == 0) {
+                for (const auto& s : sessions) {
+                    if (std::find(s.partitions.begin(), s.partitions.end(), task->id) !=
+                        s.partitions.end()) {
+                        task->serial = s.serial;
+                        task->model = s.model;
+                        task->disk_size = s.size;
+                        break;
+                    }
+                }
+            }
             task->fs_type = fs_type_from_name(j.value("fs", std::string("NTFS")));
             task->total_files.store(j.value("total_files", static_cast<uint64_t>(0)));
             task->deleted_files.store(j.value("deleted_files", static_cast<uint64_t>(0)));
@@ -1623,6 +1658,9 @@ void Scanner::raw_scan_all_worker(std::shared_ptr<ScanTask> meta) {
         t->mode = "raw";
         t->disk_number = disk;
         t->raw = true;
+        t->serial = serial;
+        t->model = model;
+        t->disk_size = full;
         t->fs_type = spawns[k].fs;
         t->cluster_size = spawns[k].cluster_size;
         t->volume_start = spawns[k].volume_start;

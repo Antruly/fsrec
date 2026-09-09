@@ -299,6 +299,43 @@ json enumerate_physical_disks() {
     return arr;
 }
 
+// Is an all-zero (or empty) serial usable? Many disks / USB bridges report
+// "0000...00" — treat that as "no serial" so we fall back to model+size.
+bool is_zero_serial(const std::string& s) {
+    return s.empty() || s.find_first_not_of('0') == std::string::npos;
+}
+
+// Compare a disk identity recorded at scan time against one physical disk
+// (`cur`, a /api/physical_disks element) currently attached. Serial is the
+// strongest key; when absent/all-zero we require model + size to both match
+// (whichever are known). If there is no usable identity at all we return false
+// — it is always safer to refuse recovery than to guess.
+bool disk_identity_matches(const std::string& serial, const std::string& model,
+                           uint64_t size, const json& cur) {
+    if (!is_zero_serial(serial)) {
+        return cur.value("serial", "") == serial;
+    }
+    bool has_model = !model.empty();
+    bool has_size = size > 0;
+    if (!has_model && !has_size) return false;
+    if (has_model && cur.value("model", "") != model) return false;
+    if (has_size && cur.value("size", static_cast<uint64_t>(0)) != size) return false;
+    return true;
+}
+
+// Does the physical disk currently present at `disk_number` still match the
+// identity recorded at scan time? Returns false when the disk is absent or has
+// been replaced by a *different* disk (a reused \\.\PhysicalDriveN slot).
+bool source_disk_connected(int disk_number, const std::string& serial,
+                           const std::string& model, uint64_t size,
+                           const json& disks) {
+    for (const auto& d : disks) {
+        if (d.value("disk_number", -1) == disk_number)
+            return disk_identity_matches(serial, model, size, d);
+    }
+    return false;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -432,7 +469,7 @@ void HttpApi::setup(uvcpp::uvcpp_http_server& server,
         auto* stats_timer = new uvcpp::uvcpp_timer(server.get_tcp_server()->get_loop());
         stats_timer->start([this](uvcpp::uvcpp_timer*) {
             static uint64_t last_bytes = total_bytes_read();
-            static std::set<int> last_disk_set;
+            static std::set<std::string> last_disk_set;
             static int tick = 0;
             static auto last_t = std::chrono::steady_clock::now();
 
@@ -500,10 +537,19 @@ void HttpApi::setup(uvcpp::uvcpp_http_server& server,
 
             // Hot-plug detection (every 3s): if the set of visible physical disks
             // changed, push the fresh list so the UI updates without a refresh.
+            // Key on full identity (serial/model/size), not just the slot number,
+            // so swapping a *different* disk into the same \\.\PhysicalDriveN slot
+            // is detected too — disk_number alone would miss it and the UI would
+            // keep showing a stale "connected" status.
             if (++tick % 3 == 0) {
                 json list = enumerate_physical_disks();
-                std::set<int> cur;
-                for (const auto& d : list) cur.insert(d.value("disk_number", -1));
+                std::set<std::string> cur;
+                for (const auto& d : list) {
+                    cur.insert(std::to_string(d.value("disk_number", -1)) + "|" +
+                               d.value("serial", "") + "|" +
+                               d.value("model", "") + "|" +
+                               std::to_string(d.value("size", static_cast<uint64_t>(0))));
+                }
                 if (cur != last_disk_set) {
                     last_disk_set = cur;
                     json h;
@@ -669,6 +715,7 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
         // scan per serial survives; re-scanning the same disk replaces it.
         if (r == "scans" && segs.size() == 2 && is_get) {
             json arr = json::array();
+            json disks = enumerate_physical_disks();
             for (const auto& s : scanner_.list_sessions()) {
                 json j;
                 j["key"] = s.key;
@@ -677,6 +724,11 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
                 j["size"] = s.size;
                 j["disk_number"] = s.disk_number;
                 j["scanned_at"] = s.scanned_at;
+                // Authoritative "still attached" verdict, computed server-side
+                // from the disk's recorded identity — the frontend must trust
+                // this rather than re-deriving it (or matching by disk number).
+                j["connected"] = source_disk_connected(s.disk_number, s.serial,
+                                                       s.model, s.size, disks);
 
                 json parts = json::array();
                 for (const auto& id : s.partitions) {
@@ -916,6 +968,21 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
 
                 auto task = scanner_.get_task(task_id);
                 if (!task) { set_error(resp, uvcpp::http_status::NOT_FOUND, "scan task not found"); return; }
+
+                // Safety: the source disk must still be the SAME physical disk
+                // that was scanned. A reused \\.\PhysicalDriveN slot (original
+                // disk unplugged and a different one now occupying that number)
+                // must never recover the wrong disk's data — validate by serial,
+                // falling back to model+size. No usable identity → refuse (safe).
+                if (task->raw && task->disk_number >= 0) {
+                    json disks = enumerate_physical_disks();
+                    if (!source_disk_connected(task->disk_number, task->serial,
+                                               task->model, task->disk_size, disks)) {
+                        set_error(resp, uvcpp::http_status::CONFLICT,
+                                  "源磁盘已断开连接或已被其他磁盘替换，已禁止恢复；请重新挂载原磁盘后重试。");
+                        return;
+                    }
+                }
 
                 // Safety: refuse a destination that lives on the source disk.
                 {

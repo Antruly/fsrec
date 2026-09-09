@@ -332,7 +332,7 @@
     <div class="topbar-inner">
       <div class="logo">🛠️</div>
       <div class="brand">
-        <h1>fsrec <span class="ver">v1.0.9</span></h1>
+        <h1>fsrec <span class="ver">v1.0.10</span></h1>
         <p class="sub">数据恢复 · 误格式化 / 覆盖的硬盘 · 只读扫描定位 → 手动确认恢复</p>
       </div>
       <div class="topbar-right">
@@ -471,7 +471,7 @@
 
   <footer class="footer">
     <div class="footer-inner">
-      <span>fsrec <span class="ver">v1.0.9</span> · 数据恢复工具</span>
+      <span>fsrec <span class="ver">v1.0.10</span> · 数据恢复工具</span>
       <span class="footer-sep">·</span>
       <span>扫描阶段只读，绝不写入源盘；恢复需手动确认</span>
       <span class="footer-sep">·</span>
@@ -527,7 +527,7 @@
       <div class="modal-head">关于 fsrec <button class="modal-x" id="closeAbout">✕</button></div>
       <div class="about-body">
         <div class="about-logo">🛠️</div>
-        <h2 class="about-title">fsrec <span class="ver">v1.0.9</span></h2>
+        <h2 class="about-title">fsrec <span class="ver">v1.0.10</span></h2>
         <p class="about-tagline">数据恢复工具</p>
         <p class="about-desc">通过 Windows 原始磁盘读取接口解析 NTFS / FAT / exFAT 文件系统、重建目录树，帮助你在硬盘被误格式化、分区被覆盖或文件被删除后，浏览并恢复文件与目录结构。</p>
         <div class="about-stack">
@@ -578,6 +578,9 @@ let diskHistory = {}; // disk_number -> [{t, r, w, u}] rolling window for the ch
 let expandedDisk = null; // disk number whose real-time chart is open
 let scanDiskNumber = null; // disk currently being scanned (for hot-unplug prompt)
 let sourceConnected = true; // whether the loaded scan's source disk is currently attached
+let currentSerial = null;   // identity of the loaded scan's source disk (for re-check on hot-plug)
+let currentModel = null;
+let currentSize = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -603,12 +606,13 @@ function isZeroSerial(s) {
   return !s || /^0+$/.test(String(s).trim());
 }
 // Is a saved scan's source disk still attached? Match by the most stable
-// identity available: serial (strongest) -> (model + size) -> disk number
-// (weakest). A reused \\.\PhysicalDriveN number must never cause a false
-// "same disk" match, which is why disk number is only the last resort.
+// identity available: serial (strongest) -> (model + size). A reused
+// \\.\PhysicalDriveN number must never cause a false "same disk" match, so when
+// no usable identity is recorded we return false (treat as disconnected) rather
+// than fall back to disk number. This is only a fallback: the backend now
+// computes an authoritative `connected` field that the UI prefers.
 function diskConnected(diskNumber, serial, model, size) {
   if (!diskList || !diskList.length) return true; // enumeration failed -> don't warn falsely
-  const dn = Number(diskNumber);
   const norm = (v) => String(v == null ? '' : v).trim();
   const hasSerial = !isZeroSerial(serial);
   const hasModel = norm(model).length > 0;
@@ -620,7 +624,7 @@ function diskConnected(diskNumber, serial, model, size) {
       (!hasModel || norm(d.model) === norm(model)) &&
       (!hasSize || Number(d.size) === Number(size)));
   }
-  return diskList.some(d => Number(d.disk_number) === dn); // last resort
+  return false; // no usable identity -> refuse rather than match a reused slot
 }
 
 async function apiGet(path) {
@@ -857,8 +861,19 @@ function handleDiskChange(list) {
     delete diskHistory[n];
   }
   diskList = list;
+  // If a scan's results are loaded, re-check whether its source disk is still
+  // attached (a disk swapped into the same slot must flip the recover banner).
+  if (currentTaskId) {
+    sourceConnected = diskConnected(currentDiskNumber, currentSerial, currentModel, currentSize);
+    $('srcDisconnected').style.display = sourceConnected ? 'none' : '';
+    $('srcDiskNum').textContent = currentDiskNumber;
+  }
   renderDisks();
   toggleScanEnabled();
+  // Re-render the saved-scans list so each session's "已连接 / 已断开" status
+  // reflects the authoritative backend `connected` verdict (a disk swapped into
+  // the same slot must flip the status even though the disk_number is unchanged).
+  loadSavedScans();
 }
 
 async function loadSavedScans() {
@@ -881,7 +896,8 @@ async function loadSavedScans() {
     info.className = 'info';
     const t = s.scanned_at ? new Date(s.scanned_at * 1000) : null;
     const timeStr = (t && !isNaN(t)) ? fmtTime(t.toISOString()) : '—';
-    const connected = diskConnected(s.disk_number, s.serial, s.model, s.size);
+    const connected = (s.connected != null) ? !!s.connected
+      : diskConnected(s.disk_number, s.serial, s.model, s.size);
     const serialStr = (connected && !isZeroSerial(s.serial)) ? ` · 序列号 <b>${esc(s.serial)}</b>` : '';
     const statusStr = connected
       ? '<span class="scan-status ok">● 已连接</span>'
@@ -926,7 +942,7 @@ async function loadSavedScans() {
         const pbtn = document.createElement('button');
         pbtn.className = 'btn primary';
         pbtn.textContent = '加载此扫描';
-        pbtn.addEventListener('click', () => loadResults(p.task_id, p.disk_number, s.serial, s.model, s.size, p.fs));
+        pbtn.addEventListener('click', () => loadResults(p.task_id, p.disk_number, s.serial, s.model, s.size, s.connected, p.fs));
         row.appendChild(pinfo);
         row.appendChild(pbtn);
         sub.appendChild(row);
@@ -1112,13 +1128,17 @@ async function restoreActive() {
 // ---------------------------------------------------------------------------
 // Results + tree
 // ---------------------------------------------------------------------------
-async function loadResults(taskId, disk, serial, model, size, fs) {
+async function loadResults(taskId, disk, serial, model, size, connected, fs) {
   try {
     const tree = await apiGet(`/api/scan/${taskId}/results`);
     rootTree = tree;
     currentTaskId = taskId;
     currentDiskNumber = disk;
-    sourceConnected = diskConnected(disk, serial, model, size);
+    currentSerial = serial;
+    currentModel = model;
+    currentSize = size;
+    sourceConnected = (connected != null) ? !!connected
+      : diskConnected(disk, serial, model, size);
     const fsBadge = $('sumFs');
     if (fs) { fsBadge.textContent = fs; fsBadge.style.display = ''; }
     else fsBadge.style.display = 'none';
