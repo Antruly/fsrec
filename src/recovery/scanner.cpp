@@ -138,7 +138,7 @@ bool save_scan_file(const std::shared_ptr<ScanTask>& task, const std::string& da
     if (task->disk_number < 0 || data_dir.empty()) return false;
     try {
         FileNodePtr root;
-        uint64_t cluster_size = 0, volume_start = 0, mft_offset = 0, mft_records_total = 0;
+        uint64_t cluster_size = 0, volume_start = 0, volume_size = 0, mft_offset = 0, mft_records_total = 0;
         uint64_t total = 0, deleted = 0, dirs = 0;
         FsType fs = FsType::NTFS;
         {
@@ -146,6 +146,7 @@ bool save_scan_file(const std::shared_ptr<ScanTask>& task, const std::string& da
             root = task->root;
             cluster_size = task->cluster_size;
             volume_start = task->volume_start;
+            volume_size = task->volume_size;
             mft_offset = task->mft_offset;
             mft_records_total = task->mft_records_total;
             total = task->total_files.load();
@@ -165,6 +166,7 @@ bool save_scan_file(const std::shared_ptr<ScanTask>& task, const std::string& da
         j["mft_offset"] = mft_offset;
         j["cluster_size"] = cluster_size;
         j["volume_start"] = volume_start;
+        j["volume_size"] = volume_size;
         j["mft_records_total"] = mft_records_total;
         j["total_files"] = total;
         j["deleted_files"] = deleted;
@@ -829,6 +831,7 @@ void Scanner::load_saved(const std::string& data_dir) {
             task->mft_offset = j.value("mft_offset", static_cast<uint64_t>(0));
             task->cluster_size = j.value("cluster_size", static_cast<uint64_t>(0));
             task->volume_start = j.value("volume_start", static_cast<uint64_t>(0));
+            task->volume_size = j.value("volume_size", static_cast<uint64_t>(0));
             task->mft_records_total = j.value("mft_records_total", static_cast<uint64_t>(0));
             task->serial = j.value("serial", "");
             task->model = j.value("model", "");
@@ -1390,11 +1393,28 @@ void Scanner::raw_scan_worker(std::shared_ptr<ScanTask> task) {
     const uint64_t kMaxRecords = 50'000'000ULL;
     if (total_records > kMaxRecords) total_records = kMaxRecords;
 
+    // Read the located NTFS volume's boot sector to learn its total size, so the
+    // UI can draw each partition's extent on the physical disk.
+    uint64_t volume_size = 0;
+    if (volume_start != 0 && cluster_size != 0) {
+        std::vector<uint8_t> boot(512);
+        size_t rg = 0;
+        if (reader.read(volume_start, boot.data(), 512, &rg) && rg >= 512) {
+            uint64_t bps = static_cast<uint64_t>(boot[0x0B]) |
+                           (static_cast<uint64_t>(boot[0x0C]) << 8);
+            uint64_t total_sectors = 0;
+            for (int i = 7; i >= 0; --i)
+                total_sectors = (total_sectors << 8) | boot[0x28 + i];
+            if (bps != 0) volume_size = total_sectors * bps;
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(task->mtx);
         task->mft_offset = chosen_off;
         task->cluster_size = cluster_size;
         task->volume_start = volume_start;
+        task->volume_size = volume_size;
         task->mft_records_total = total_records;
         task->candidates = std::move(cands);
     }
@@ -1498,12 +1518,14 @@ void Scanner::fat_scan_worker(std::shared_ptr<ScanTask> task) {
     FsType fs = task->fs_type;
     FatScanResult res;
     bool ok = false;
+    uint64_t vol_size = 0;  // volume byte size (total sectors × bytes per sector)
     if (fs == FsType::exFAT) {
         ExfatBootInfo ei;
         if (!parse_exfat_boot(boot.data(), ei, &err)) {
             finish("failed", "parse exFAT boot sector: " + err);
             return;
         }
+        vol_size = ei.volume_length * ei.bytes_per_sector();
         ok = scan_exfat_volume(reader, ei, res, task->stop_requested, &err);
     } else if (fs == FsType::FAT12 || fs == FsType::FAT16 || fs == FsType::FAT32) {
         FatBootInfo fi;
@@ -1511,6 +1533,7 @@ void Scanner::fat_scan_worker(std::shared_ptr<ScanTask> task) {
             finish("failed", "parse FAT boot sector: " + err);
             return;
         }
+        vol_size = fi.total_sectors() * fi.bytes_per_sector;
         ok = scan_fat_volume(reader, fi, res, task->stop_requested, &err);
     } else {
         finish("failed", "unsupported filesystem type");
@@ -1527,6 +1550,7 @@ void Scanner::fat_scan_worker(std::shared_ptr<ScanTask> task) {
         std::lock_guard<std::mutex> lock(task->mtx);
         task->root = res.root;
         task->nodes = std::move(res.nodes);
+        task->volume_size = vol_size;
         task->total_files.store(res.total_files);
         task->deleted_files.store(res.deleted_files);
         task->directories.store(res.directories);

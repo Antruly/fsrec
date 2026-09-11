@@ -74,6 +74,7 @@ struct ScanTask {
     std::vector<RawMftCandidate> candidates;
     uint64_t cluster_size = 0;      // detected cluster size in bytes (raw mode)
     uint64_t volume_start = 0;      // detected volume start byte offset (raw mode)
+    uint64_t volume_size = 0;       // detected volume byte size (0 = unknown)
     uint64_t mft_records_total = 0; // total $MFT records (from record 0 $DATA)
 
     // Filesystem family this volume was parsed as (NTFS / FAT12 / FAT16 /

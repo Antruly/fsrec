@@ -2,7 +2,7 @@
 ; 编译：ISCC.exe packaging\fsrec.iss   （或运行 scripts\build_release.ps1）
 
 #define MyAppName "fsrec"
-#define MyAppVersion "1.0.14"
+#define MyAppVersion "1.0.15"
 #define MyAppPublisher "fsrec"
 #define MyAppExeName "recovery_server.exe"
 
@@ -57,13 +57,14 @@ Name: "{group}\停止 fsrec"; Filename: "{app}\stop.bat"; WorkingDir: "{app}"; I
 Name: "{autodesktop}\fsrec"; Filename: "{app}\start.bat"; Tasks: desktopicon; WorkingDir: "{app}"; IconFilename: "{app}\fsrec.ico"
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--port {code:GetPort}"; Description: "立即启动 fsrec"; Flags: postinstall nowait skipifsilent runascurrentuser
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--port {code:GetPort} --host {code:GetHost}"; Description: "立即启动 fsrec"; Flags: postinstall nowait skipifsilent runascurrentuser
 
 [Code]
 var
   WarnPage: TInputOptionWizardPage;
   PortPage: TInputQueryWizardPage;
   SelectedPort: Integer;
+  SelectedHost: String;
 
 function PortInUse(Port: Integer): Boolean;
 var
@@ -97,9 +98,57 @@ begin
   Result := IntToStr(SelectedPort);
 end;
 
+function GetHost(Param: String): String;
+begin
+  Result := SelectedHost;
+end;
+
+function IsValidIp(const S: String): Boolean;
+var
+  I, Num, Part, Dots: Integer;
+  Ch: Char;
+  HasColon: Boolean;
+begin
+  Result := False;
+  if Trim(S) = '' then Exit;
+  // IPv6 address (contains ':') — accepted here; libuv validates precisely
+  // at bind time and reports a clear error if it's malformed.
+  HasColon := False;
+  for I := 1 to Length(S) do
+    if S[I] = ':' then HasColon := True;
+  if HasColon then
+  begin
+    Result := True;
+    Exit;
+  end;
+  // IPv4: exactly four 0-255 octets separated by '.'
+  Num := 0; Part := 0; Dots := 0;
+  for I := 1 to Length(S) do
+  begin
+    Ch := S[I];
+    if Ch = '.' then
+    begin
+      if (Part = 0) or (Num > 255) then Exit;
+      Inc(Dots);
+      Num := 0; Part := 0;
+    end
+    else if (Ch >= '0') and (Ch <= '9') then
+    begin
+      Num := Num * 10 + (Ord(Ch) - Ord('0'));
+      if Num > 255 then Exit;
+      Inc(Part);
+    end
+    else
+      Exit;
+  end;
+  if (Part = 0) or (Num > 255) or (Dots <> 3) then Exit;
+  Result := True;
+end;
+
 procedure InitializeWizard();
 begin
   SelectedPort := 8080;
+  SelectedHost := '127.0.0.1';
 
   WarnPage := CreateInputOptionPage(
     wpLicense,
@@ -115,16 +164,20 @@ begin
 
   PortPage := CreateInputQueryPage(
     WarnPage.ID,
-    '服务端口设置',
-    '选择 fsrec 服务端口',
-    'fsrec 启动后通过该端口提供网页界面，请设置一个未被占用的端口（默认 8080）。');
+    '服务监听设置',
+    '设置 fsrec 服务端口与监听地址',
+    'fsrec 启动后通过该端口提供网页界面。监听地址默认 127.0.0.1（仅本机可访问，最安全）；'
+    + '如需让局域网内其他设备访问，请改为 0.0.0.0（监听所有网卡），或填写具体网卡 IP。');
   PortPage.Add('服务端口：', False);
+  PortPage.Add('监听地址：', False);
   PortPage.Values[0] := '8080';
+  PortPage.Values[1] := '127.0.0.1';
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
   Port: Integer;
+  Host: String;
 begin
   Result := True;
   if CurPageID = WarnPage.ID then
@@ -139,9 +192,15 @@ begin
   else if CurPageID = PortPage.ID then
   begin
     Port := StrToIntDef(Trim(PortPage.Values[0]), 0);
+    Host := Trim(PortPage.Values[1]);
     if (Port < 1) or (Port > 65535) then
     begin
       MsgBox('端口必须是 1–65535 之间的整数。', mbError, MB_OK);
+      Result := False;
+    end
+    else if not IsValidIp(Host) then
+    begin
+      MsgBox('监听地址必须是有效的 IP 地址（如 127.0.0.1、0.0.0.0 或具体网卡 IP）。', mbError, MB_OK);
       Result := False;
     end
     else if PortInUse(Port) then
@@ -150,12 +209,18 @@ begin
       Result := False;
     end
     else
+    begin
       SelectedPort := Port;
+      SelectedHost := Host;
+    end;
   end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
+  begin
     SaveStringToFile(ExpandConstant('{app}\port.txt'), IntToStr(SelectedPort), False);
+    SaveStringToFile(ExpandConstant('{app}\host.txt'), SelectedHost, False);
+  end;
 end;

@@ -17,6 +17,7 @@
 
 #include "http/server.h"
 #include "include/version.h"
+#include "include/logger.h"
 #include "recovery/restorer.h"
 #include "recovery/scanner.h"
 
@@ -56,7 +57,7 @@ BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
     case CTRL_SHUTDOWN_EVENT:
     case CTRL_LOGOFF_EVENT:
         if (!g_shutting_down.exchange(true)) {
-            std::fprintf(stderr, "[fsrec] 正在安全关闭服务，请稍候…\n");
+            FSLOG_WARN("正在安全关闭服务，请稍候…");
             start_shutdown_watchdog();
             if (g_stop_stats) g_stop_stats();
             if (g_scanner)  g_scanner->shutdown();
@@ -132,15 +133,20 @@ int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 
-    // Optional CLI flags: --port <n> (default 8080), --no-browser (don't
-    // auto-open the web UI in the default browser on startup).
+    // Optional CLI flags:
+    //   --port <n>    listen port (default 8080)
+    //   --host <ip>   listen address (default 127.0.0.1 = loopback only)
+    //   --no-browser  don't auto-open the web UI in the default browser
     int port = 8080;
+    std::string host = "127.0.0.1";
     bool open_browser = true;
     bool port_overridden = false;
+    bool host_overridden = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--no-browser") open_browser = false;
         else if (a == "--port" && i + 1 < argc) { port = std::atoi(argv[++i]); port_overridden = true; }
+        else if (a == "--host" && i + 1 < argc) { host = argv[++i]; host_overridden = true; }
     }
 
     // Raw volume access requires an elevated (Run as administrator) process.
@@ -167,6 +173,22 @@ int main(int argc, char** argv) {
         int p = 0;
         if (pf >> p && p > 0 && p < 65536)
             port = p;
+    }
+
+    // Read the configured listen address from host.txt (written by the
+    // installer), so the service binds to the address chosen during setup.
+    // Default is 127.0.0.1 (loopback only) — the web UI stays local unless the
+    // user explicitly opts into 0.0.0.0 (all interfaces) or a specific IP.
+    // An explicit --host on the command line always wins.
+    if (!host_overridden) {
+        std::ifstream hf(root + "\\host.txt");
+        std::string h;
+        if (std::getline(hf, h)) {
+            while (!h.empty() && (h.back() == '\r' || h.back() == '\n' ||
+                                  h.back() == ' ' || h.back() == '\t'))
+                h.pop_back();
+            if (!h.empty()) host = h;
+        }
     }
 
     // Make sure the data dir exists so the first scan can be persisted.
@@ -197,7 +219,7 @@ int main(int argc, char** argv) {
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
     api.set_shutdown_callback([&]() {
         if (!g_shutting_down.exchange(true)) {
-            std::fprintf(stderr, "[fsrec] 正在安全关闭服务…\n");
+            FSLOG_WARN("正在安全关闭服务…");
             start_shutdown_watchdog();
             api.stop_stats();
             scanner.shutdown();
@@ -207,7 +229,7 @@ int main(int argc, char** argv) {
         }
     });
 
-    const char* ip = "0.0.0.0";
+    const char* ip = host.c_str();
     if (server.bind(ip, port) != 0) {
         std::fprintf(stderr, "[recovery_server] ERROR: failed to bind %s:%d\n", ip, port);
         return 1;
@@ -217,13 +239,24 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::string url = "http://localhost:" + std::to_string(port);
-    std::printf("[%s] v%s listening on %s\n", FSREC_NAME, FSREC_VERSION, url.c_str());
-    std::printf("[%s] health check: %s/ping\n", FSREC_NAME, url.c_str());
-    std::printf("[%s] frontend:     %s/\n", FSREC_NAME, url.c_str());
-    std::printf("[%s] static dir:   %s\n", FSREC_NAME, static_dir.c_str());
-    std::printf("[%s] data dir:     %s\n", FSREC_NAME, data_dir.c_str());
-    std::fflush(stdout);
+    // For the auto-opened browser and the friendly URL, use loopback whenever the
+    // server listens on a wildcard/loopback address; otherwise the literal IP.
+    bool loopback = (host == "0.0.0.0" || host == "127.0.0.1" ||
+                     host == "::" || host == "::1" || host == "localhost");
+    std::string url = "http://" + std::string(loopback ? "localhost" : host) +
+                      ":" + std::to_string(port);
+
+    // Initialize the console/file logger. The dashboard banner pins the version
+    // and the web UI URL at the top (so they're never scrolled away), and every
+    // entry is also appended to a daily file under <root>\logs\fsrec_YYYY-MM-DD.log.
+    fslog::Logger::instance().init(root + "\\logs", FSREC_VERSION, url);
+
+    FSLOG_INFO("服务已启动，监听 %s:%d", ip, port);
+    FSLOG_INFO("静态目录 %s", static_dir.c_str());
+    FSLOG_INFO("数据目录 %s", data_dir.c_str());
+    if (host == "0.0.0.0" || host == "::") {
+        FSLOG_WARN("正监听在所有网络接口（%s），网页界面可能被局域网内其他主机访问", ip);
+    }
 
     if (open_browser) {
         // Open the web UI in the default browser. Best-effort: return values
@@ -232,5 +265,7 @@ int main(int argc, char** argv) {
     }
 
     server.run();
+
+    fslog::Logger::instance().shutdown();
     return 0;
 }

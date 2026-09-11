@@ -23,6 +23,7 @@ namespace fs = std::filesystem;
 
 #include "../include/util.h"
 #include "../include/version.h"
+#include "../include/logger.h"
 #include "../ntfs/disk_reader.h"
 
 #include <handle/uvcpp_timer.h>
@@ -336,6 +337,52 @@ bool source_disk_connected(int disk_number, const std::string& serial,
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// Logging helpers
+// ---------------------------------------------------------------------------
+
+// HTTP method → short string, for per-request logging.
+const char* method_name(uvcpp::http_method m) {
+    switch (m) {
+    case uvcpp::http_method::HTTP_GET:     return "GET";
+    case uvcpp::http_method::HTTP_POST:    return "POST";
+    case uvcpp::http_method::HTTP_OPTIONS: return "OPTIONS";
+    default:                               return "?";
+    }
+}
+
+// Log the terminal (non-progress) recovery events that the scanner/restorer
+// worker threads push through the WS hub, so the console shows scan/recover
+// outcomes without drowning in per-tick progress spam.
+void log_worker_event(const std::string& msg, bool is_scan) {
+    try {
+        json j = json::parse(msg);
+        std::string type = j.value("type", "");
+        if (type == "done") {
+            if (is_scan) {
+                FSLOG_SUCCESS("扫描完成：文件 %d / 目录 %d / 已删除 %d",
+                              j.value("total_files", 0),
+                              j.value("directories", 0),
+                              j.value("deleted_files", 0));
+            } else {
+                uint64_t rb = j.contains("recovered_bytes")
+                                  ? j["recovered_bytes"].get<uint64_t>() : 0;
+                FSLOG_SUCCESS("恢复完成：成功 %d / 失败 %d / 共 %.1f MiB",
+                              j.value("recovered_files", 0),
+                              j.value("failed_files", 0),
+                              static_cast<double>(rb) / 1048576.0);
+            }
+        } else if (type == "error") {
+            std::string err = j.value("error", "未知错误");
+            FSLOG_ERROR("%s出错：%s", is_scan ? "扫描" : "恢复", err.c_str());
+        } else if (type == "stopped") {
+            FSLOG_WARN("%s已被用户停止", is_scan ? "扫描" : "恢复");
+        }
+    } catch (...) {
+        // Logging must never throw — ignore malformed frames.
+    }
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -349,8 +396,15 @@ struct HttpApi::Hub {
 };
 
 void HttpApi::remove_client(uvcpp::uvcpp_ws_connection* conn) {
-    std::lock_guard<std::mutex> lock(clients_mtx_);
-    clients_.erase(conn);
+    size_t count = 0;
+    bool removed = false;
+    {
+        std::lock_guard<std::mutex> lock(clients_mtx_);
+        removed = clients_.erase(conn) > 0;  // graceful close fires WS + TCP callbacks
+        count = clients_.size();
+    }
+    if (removed)
+        FSLOG_INFO("WebSocket 客户端已断开，当前连接数 %zu", count);
 }
 
 void HttpApi::broadcast(const std::string& msg) {
@@ -511,10 +565,13 @@ void HttpApi::on_ws_command(uvcpp::uvcpp_ws_connection* conn,
 }
 
 void HttpApi::on_ws_connection(uvcpp::uvcpp_ws_connection* conn) {
+    size_t count = 0;
     {
         std::lock_guard<std::mutex> lock(clients_mtx_);
         clients_.insert(conn);
+        count = clients_.size();
     }
+    FSLOG_INFO("WebSocket 客户端已连接，当前连接数 %zu", count);
     conn->on_text([this, conn](const std::string& msg) { on_ws_command(conn, msg); });
 
     // Graceful WS close (CLOSE frame). We only remove the connection here; the
@@ -553,6 +610,7 @@ void HttpApi::setup(uvcpp::uvcpp_http_server& server,
                       server.get_tcp_server()->get_loop());
 
     restorer_.set_event_callback([hub = hub_](const std::string& msg) {
+        log_worker_event(msg, false);
         {
             std::lock_guard<std::mutex> lock(hub->mtx);
             hub->queue.push_back(msg);
@@ -560,6 +618,7 @@ void HttpApi::setup(uvcpp::uvcpp_http_server& server,
         if (hub->async) hub->async->send();
     });
     scanner_.set_event_callback([hub = hub_](const std::string& msg) {
+        log_worker_event(msg, true);
         {
             std::lock_guard<std::mutex> lock(hub->mtx);
             hub->queue.push_back(msg);
@@ -616,8 +675,10 @@ void HttpApi::setup(uvcpp::uvcpp_http_server& server,
         bool is_opt = (req.method == uvcpp::http_method::HTTP_OPTIONS);
 
         if (is_api || is_opt) {
+            FSLOG_DEBUG("HTTP %s %s", method_name(req.method), p.c_str());
             handle_request(req, resp, client);
         } else if (static_) {
+            FSLOG_DEBUG("静态资源 %s", p.c_str());
             static_->serve(req, resp, client, &server);
         } else {
             set_error(resp, uvcpp::http_status::NOT_FOUND, "unknown endpoint");
@@ -793,6 +854,7 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
                         p["mft_offset"] = t->mft_offset;
                         p["cluster_size"] = t->cluster_size;
                         p["volume_start"] = t->volume_start;
+                        p["volume_size"] = t->volume_size;
                     }
                     parts.push_back(std::move(p));
                 }
@@ -812,6 +874,7 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
                 if (key.empty()) { set_error(resp, uvcpp::http_status::BAD_REQUEST, "key is required"); return; }
                 bool ok = scanner_.delete_scan(key);
                 if (!ok) { set_error(resp, uvcpp::http_status::NOT_FOUND, "scan session not found"); return; }
+                FSLOG_INFO("删除扫描会话 %s", key.c_str());
                 json out; out["ok"] = true;
                 set_json(resp, uvcpp::http_status::OK, out.dump());
             } catch (const std::exception& e) {
@@ -824,6 +887,7 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
         // Respond first, then stop the loop on a detached thread so the reply
         // is flushed before the server tears down.
         if (r == "shutdown" && segs.size() == 2 && is_post) {
+            FSLOG_WARN("收到「退出关闭服务」请求，正在安全关闭…");
             json out; out["ok"] = true;
             set_json(resp, uvcpp::http_status::OK, out.dump());
             if (shutdown_cb_) {
@@ -842,6 +906,8 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
                 int disk = body.value("disk_number", -1);
                 uint64_t hint = body.value("mft_offset", static_cast<uint64_t>(0));
                 if (disk < 0) { set_error(resp, uvcpp::http_status::BAD_REQUEST, "disk_number is required"); return; }
+                FSLOG_INFO("开始扫描磁盘 %d（MFT 偏移 %llu）", disk,
+                           static_cast<unsigned long long>(hint));
                 std::string id = scanner_.start_raw_scan(disk, hint);
                 json out; out["task_id"] = id;
                 set_json(resp, uvcpp::http_status::OK, out.dump());
@@ -860,6 +926,7 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
                 int disk = body.value("disk_number", -1);
                 if (disk < 0) { set_error(resp, uvcpp::http_status::BAD_REQUEST, "disk_number is required"); return; }
                 bool deep = body.value("deep", false);
+                FSLOG_INFO("开始%s扫描磁盘 %d（定位所有分区）", deep ? "深度" : "快速", disk);
                 std::string id = scanner_.start_raw_scan_all(disk, deep);
                 json out; out["task_id"] = id;
                 set_json(resp, uvcpp::http_status::OK, out.dump());
@@ -876,6 +943,7 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
                 std::string drive = body.value("drive", "");
                 std::string mode  = body.value("scan_mode", "quick");
                 if (drive.empty()) { set_error(resp, uvcpp::http_status::BAD_REQUEST, "drive is required"); return; }
+                FSLOG_INFO("开始扫描盘符 %s（模式 %s）", drive.c_str(), mode.c_str());
                 std::string id = scanner_.start_scan(drive, mode);
                 json out; out["task_id"] = id;
                 set_json(resp, uvcpp::http_status::OK, out.dump());
@@ -907,6 +975,7 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
                 out["mft_offset"] = t->mft_offset;
                 out["cluster_size"] = t->cluster_size;
                 out["volume_start"] = t->volume_start;
+                out["volume_size"] = t->volume_size;
                 out["mft_records_total"] = t->mft_records_total;
                 json cands = json::array();
                 for (const auto& c : t->candidates) {
@@ -948,6 +1017,8 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
             else if (segs[3] == "resume") ok = scanner_.resume(segs[2]);
             else                          ok = scanner_.stop(segs[2]);
             if (!ok) { set_error(resp, uvcpp::http_status::NOT_FOUND, "scan task not found or already finished"); return; }
+            FSLOG_INFO("扫描任务 %s 已%s", segs[2].c_str(),
+                       segs[3] == "pause" ? "暂停" : segs[3] == "resume" ? "继续" : "停止");
             json out; out["ok"] = true;
             set_json(resp, uvcpp::http_status::OK, out.dump());
             return;
@@ -1050,6 +1121,7 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
                 }
 
                 std::string job_id = restorer_.start_recover(task, paths, output_dir);
+                FSLOG_INFO("开始恢复：%zu 个路径 → %s", paths.size(), output_dir.c_str());
                 json out; out["job_id"] = job_id;
                 set_json(resp, uvcpp::http_status::OK, out.dump());
             } catch (const std::exception& e) {
@@ -1091,6 +1163,8 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
             else if (segs[3] == "resume") ok = restorer_.resume(segs[2]);
             else                          ok = restorer_.stop(segs[2]);
             if (!ok) { set_error(resp, uvcpp::http_status::NOT_FOUND, "recover job not found or already finished"); return; }
+            FSLOG_INFO("恢复任务 %s 已%s", segs[2].c_str(),
+                       segs[3] == "pause" ? "暂停" : segs[3] == "resume" ? "继续" : "停止");
             json out; out["ok"] = true;
             set_json(resp, uvcpp::http_status::OK, out.dump());
             return;
