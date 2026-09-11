@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "../include/types.h"
+#include "../include/eta.h"
 
 namespace recovery {
 
@@ -43,6 +44,18 @@ struct ScanTask {
     std::atomic<uint64_t> total_files{0};
     std::atomic<uint64_t> deleted_files{0};
     std::atomic<uint64_t> directories{0};
+
+    // Estimated seconds remaining (updated by the worker's progress emits, read
+    // by the HTTP layer). -1 = no estimate yet.
+    std::atomic<int64_t> eta_seconds{-1};
+    EtaEstimator eta;  // worker-thread-only progress-rate state
+
+    // Byte-based ETA source. The scan progress percentage is phase-based and too
+    // coarse (the whole-disk $MFT search advances one point per ~1/8 of the
+    // disk), which starves the estimator's rate. When total_bytes > 0 the worker
+    // feeds a continuous (scanned_bytes / total_bytes) percentage instead.
+    std::atomic<uint64_t> scanned_bytes{0};
+    std::atomic<uint64_t> total_bytes{0}; // 0 = fall back to the progress %
 
     std::atomic<bool> pause_requested{false};
     std::atomic<bool> stop_requested{false};

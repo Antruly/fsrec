@@ -1,10 +1,12 @@
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <string>
+#include <thread>
 
 #include <windows.h>
 #include <shellapi.h>
@@ -27,7 +29,21 @@ static recovery::Scanner*   g_scanner  = nullptr;
 static recovery::Restorer*  g_restorer = nullptr;
 static uvcpp::uvcpp_http_server* g_server = nullptr;
 static std::atomic<bool> g_shutting_down{false};
-static std::function<void()> g_wake_loop;  // pokes the libuv loop (uv_async_send)
+static std::function<void()> g_wake_loop;   // pokes the libuv loop (uv_async_send)
+static std::function<void()> g_stop_stats;  // stops the background stats poller
+
+// Last-resort shutdown watchdog: if the graceful shutdown below hasn't let the
+// process exit within a few seconds (e.g. a worker thread or the stats poller
+// is stuck inside a blocking syscall), force-exit so the console window never
+// hangs open. Detached — killed harmlessly when the normal exit wins.
+void start_shutdown_watchdog() {
+    std::thread([]() {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        std::fprintf(stderr, "[fsrec] 优雅关闭超时，强制退出。\n");
+        std::fflush(stderr);
+        ExitProcess(0);
+    }).detach();
+}
 
 // Handle Ctrl+C, window close (X), logoff and shutdown. We take over the close
 // so the process can stop its worker threads and the event loop gracefully,
@@ -41,6 +57,8 @@ BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
     case CTRL_LOGOFF_EVENT:
         if (!g_shutting_down.exchange(true)) {
             std::fprintf(stderr, "[fsrec] 正在安全关闭服务，请稍候…\n");
+            start_shutdown_watchdog();
+            if (g_stop_stats) g_stop_stats();
             if (g_scanner)  g_scanner->shutdown();
             if (g_restorer) g_restorer->shutdown();
             if (g_server)   g_server->get_tcp_server()->stop_loop();
@@ -175,10 +193,13 @@ int main(int argc, char** argv) {
     g_restorer = &restorer;
     g_server = &server;
     g_wake_loop = [&api]() { api.wake(); };
+    g_stop_stats = [&api]() { api.stop_stats(); };
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
     api.set_shutdown_callback([&]() {
         if (!g_shutting_down.exchange(true)) {
             std::fprintf(stderr, "[fsrec] 正在安全关闭服务…\n");
+            start_shutdown_watchdog();
+            api.stop_stats();
             scanner.shutdown();
             restorer.shutdown();
             server.get_tcp_server()->stop_loop();

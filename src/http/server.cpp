@@ -378,6 +378,123 @@ void HttpApi::wake() {
     if (hub_ && hub_->async) hub_->async->send();
 }
 
+void HttpApi::stop_stats() {
+    stats_stop_.store(true);
+}
+
+HttpApi::~HttpApi() {
+    // Ask the background poller to stop, then join. The poller's sleep is in
+    // 100ms chunks so it winds down promptly; if it happens to be stuck inside
+    // a synchronous disk call (a stalled USB bridge), the shutdown watchdog in
+    // main.cpp force-exits the process so this join cannot hang the window.
+    stats_stop_.store(true);
+    if (stats_thread_.joinable()) stats_thread_.join();
+}
+
+// Background thread that samples per-disk OS-level I/O counters and re-enumerates
+// physical disks. This is the ONLY place that does synchronous disk I/O on a
+// fixed cadence; running it off the event-loop thread means a slow/stalled disk
+// can never freeze the HTTP/WS loop or block a graceful shutdown.
+void HttpApi::start_stats_poller() {
+    stats_thread_ = std::thread([this]() {
+        uint64_t last_bytes = total_bytes_read();
+        std::set<std::string> last_disk_set;
+        int tick = 0;
+        auto last_t = std::chrono::steady_clock::now();
+
+        // Per-disk counters, sampled via IOCTL_DISK_PERFORMANCE so idle disks and
+        // writes from other processes are reflected too — like Task Manager.
+        struct Perf { int64_t r = 0, w = 0, busy = 0, q = 0; };
+        Perf lastp[32];
+        bool lastp_ok[32] = {false};
+
+        auto round1 = [](double v) {
+            return static_cast<double>(static_cast<long long>(v * 10.0)) / 10.0;
+        };
+
+        while (!stats_stop_.load()) {
+            uint64_t b = total_bytes_read();
+            auto now = std::chrono::steady_clock::now();
+            double dt = std::chrono::duration<double>(now - last_t).count();
+            double mbps = dt > 0.0
+                ? static_cast<double>(b - last_bytes) / dt / (1024.0 * 1024.0)
+                : 0.0;
+            last_bytes = b;
+            last_t = now;
+
+            json j;
+            j["type"] = "sys";
+            j["read_mbps"] = round1(mbps);
+            j["read_bytes"] = b;
+
+            json disks = json::object();
+            for (int i = 0; i < 32; i++) {
+                char pbuf[64];
+                snprintf(pbuf, sizeof(pbuf), "\\\\.\\PhysicalDrive%d", i);
+                HANDLE h = CreateFileA(pbuf, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                       nullptr, OPEN_EXISTING, 0, nullptr);
+                if (h == INVALID_HANDLE_VALUE) continue;
+                DISK_PERFORMANCE p{};
+                DWORD used = 0;
+                if (DeviceIoControl(h, IOCTL_DISK_PERFORMANCE, nullptr, 0,
+                                    &p, sizeof(p), &used, nullptr)) {
+                    int64_t r = p.BytesRead.QuadPart;
+                    int64_t w = p.BytesWritten.QuadPart;
+                    int64_t busy = p.ReadTime.QuadPart + p.WriteTime.QuadPart;
+                    int64_t q = p.QueryTime.QuadPart;
+                    if (lastp_ok[i]) {
+                        double dts = static_cast<double>(q - lastp[i].q) / 1e7;
+                        if (dts > 0.0) {
+                            json d;
+                            d["read_mbps"]  = round1(static_cast<double>(r - lastp[i].r) / dts / 1e6);
+                            d["write_mbps"] = round1(static_cast<double>(w - lastp[i].w) / dts / 1e6);
+                            double util = static_cast<double>(busy - lastp[i].busy) /
+                                          static_cast<double>(q - lastp[i].q) * 100.0;
+                            if (util < 0.0) util = 0.0;
+                            if (util > 100.0) util = 100.0;
+                            d["util"] = round1(util);
+                            disks[std::to_string(i)] = std::move(d);
+                        }
+                    }
+                    lastp[i] = {r, w, busy, q};
+                    lastp_ok[i] = true;
+                }
+                CloseHandle(h);
+            }
+            j["disks"] = disks;
+            {
+                std::lock_guard<std::mutex> lock(stats_mtx_);
+                sys_frame_ = j.dump();
+            }
+
+            // Hot-plug detection (every 3s): if the set of visible physical disks
+            // changed, publish the fresh list so the UI updates without a refresh.
+            if (++tick % 3 == 0) {
+                json list = enumerate_physical_disks();
+                std::set<std::string> cur;
+                for (const auto& d : list) {
+                    cur.insert(std::to_string(d.value("disk_number", -1)) + "|" +
+                               d.value("serial", "") + "|" +
+                               d.value("model", "") + "|" +
+                               std::to_string(d.value("size", static_cast<uint64_t>(0))));
+                }
+                if (cur != last_disk_set) {
+                    last_disk_set = cur;
+                    json h;
+                    h["type"] = "disks";
+                    h["disks"] = list;
+                    std::lock_guard<std::mutex> lock(stats_mtx_);
+                    disks_frame_ = h.dump();
+                }
+            }
+
+            // Interruptible 1s sleep: wakes within ~100ms of stop_stats().
+            for (int i = 0; i < 10 && !stats_stop_.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    });
+}
+
 void HttpApi::on_ws_command(uvcpp::uvcpp_ws_connection* conn,
                             const std::string& msg) {
     (void)conn;
@@ -466,99 +583,22 @@ void HttpApi::setup(uvcpp::uvcpp_http_server& server,
     // {type:"disks", disks:[...]} frame when the set changes (hot-plug/removal),
     // so the UI reflects newly attached or pulled disks without a refresh.
     {
+        // Disk sampling (CreateFileA + IOCTL_DISK_PERFORMANCE + hot-plug
+        // enumeration) lives on a background thread — see start_stats_poller —
+        // so a slow/stalled disk can never block this event loop. This timer
+        // only drains the latest frames and broadcasts them; no disk I/O here.
         auto* stats_timer = new uvcpp::uvcpp_timer(server.get_tcp_server()->get_loop());
         stats_timer->start([this](uvcpp::uvcpp_timer*) {
-            static uint64_t last_bytes = total_bytes_read();
-            static std::set<std::string> last_disk_set;
-            static int tick = 0;
-            static auto last_t = std::chrono::steady_clock::now();
-
-            // Per-disk OS-level I/O counters (bytes read/written + busy time),
-            // sampled via IOCTL_DISK_PERFORMANCE so idle disks and writes from
-            // other processes are reflected too — like Task Manager.
-            struct Perf { int64_t r = 0, w = 0, busy = 0, q = 0; };
-            static Perf lastp[32];
-            static bool lastp_ok[32] = {false};
-
-            uint64_t b = total_bytes_read();
-            auto now = std::chrono::steady_clock::now();
-            double dt = std::chrono::duration<double>(now - last_t).count();
-            double mbps = dt > 0.0
-                ? static_cast<double>(b - last_bytes) / dt / (1024.0 * 1024.0)
-                : 0.0;
-            last_bytes = b;
-            last_t = now;
-
-            auto round1 = [](double v) {
-                return static_cast<double>(static_cast<long long>(v * 10.0)) / 10.0;
-            };
-
-            json j;
-            j["type"] = "sys";
-            j["read_mbps"] = round1(mbps);
-            j["read_bytes"] = b;
-
-            json disks = json::object();
-            for (int i = 0; i < 32; i++) {
-                char pbuf[64];
-                snprintf(pbuf, sizeof(pbuf), "\\\\.\\PhysicalDrive%d", i);
-                HANDLE h = CreateFileA(pbuf, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                       nullptr, OPEN_EXISTING, 0, nullptr);
-                if (h == INVALID_HANDLE_VALUE) continue;
-                DISK_PERFORMANCE p{};
-                DWORD used = 0;
-                if (DeviceIoControl(h, IOCTL_DISK_PERFORMANCE, nullptr, 0,
-                                    &p, sizeof(p), &used, nullptr)) {
-                    int64_t r = p.BytesRead.QuadPart;
-                    int64_t w = p.BytesWritten.QuadPart;
-                    int64_t busy = p.ReadTime.QuadPart + p.WriteTime.QuadPart;
-                    int64_t q = p.QueryTime.QuadPart;
-                    if (lastp_ok[i]) {
-                        double dts = static_cast<double>(q - lastp[i].q) / 1e7;
-                        if (dts > 0.0) {
-                            json d;
-                            d["read_mbps"]  = round1(static_cast<double>(r - lastp[i].r) / dts / 1e6);
-                            d["write_mbps"] = round1(static_cast<double>(w - lastp[i].w) / dts / 1e6);
-                            double util = static_cast<double>(busy - lastp[i].busy) /
-                                          static_cast<double>(q - lastp[i].q) * 100.0;
-                            if (util < 0.0) util = 0.0;
-                            if (util > 100.0) util = 100.0;
-                            d["util"] = round1(util);
-                            disks[std::to_string(i)] = std::move(d);
-                        }
-                    }
-                    lastp[i] = {r, w, busy, q};
-                    lastp_ok[i] = true;
-                }
-                CloseHandle(h);
+            std::string sys, disks;
+            {
+                std::lock_guard<std::mutex> lock(stats_mtx_);
+                sys.swap(sys_frame_);
+                disks.swap(disks_frame_);
             }
-            j["disks"] = disks;
-            broadcast(j.dump());
-
-            // Hot-plug detection (every 3s): if the set of visible physical disks
-            // changed, push the fresh list so the UI updates without a refresh.
-            // Key on full identity (serial/model/size), not just the slot number,
-            // so swapping a *different* disk into the same \\.\PhysicalDriveN slot
-            // is detected too — disk_number alone would miss it and the UI would
-            // keep showing a stale "connected" status.
-            if (++tick % 3 == 0) {
-                json list = enumerate_physical_disks();
-                std::set<std::string> cur;
-                for (const auto& d : list) {
-                    cur.insert(std::to_string(d.value("disk_number", -1)) + "|" +
-                               d.value("serial", "") + "|" +
-                               d.value("model", "") + "|" +
-                               std::to_string(d.value("size", static_cast<uint64_t>(0))));
-                }
-                if (cur != last_disk_set) {
-                    last_disk_set = cur;
-                    json h;
-                    h["type"] = "disks";
-                    h["disks"] = list;
-                    broadcast(h.dump());
-                }
-            }
+            if (!sys.empty()) broadcast(sys);
+            if (!disks.empty()) broadcast(disks);
         }, 1000, 1000);
+        start_stats_poller();
     }
 
     server.on_request([this, &server](uvcpp::uvcpp_http_request& req,
@@ -656,6 +696,7 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
                 s["progress"] = run_scan->progress.load();
                 s["total_files"] = run_scan->total_files.load();
                 s["directories"] = run_scan->directories.load();
+                s["eta_seconds"] = run_scan->eta_seconds.load();
                 s["disk_number"] = run_scan->disk_number;
                 s["raw"] = run_scan->raw;
                 {
@@ -682,6 +723,7 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
                 r["failed_files"] = run_job->failed_files.load();
                 r["total_bytes"] = run_job->total_bytes.load();
                 r["recovered_bytes"] = run_job->recovered_bytes.load();
+                r["eta_seconds"] = run_job->eta_seconds.load();
                 r["output_dir"] = run_job->output_dir;
                 {
                     std::lock_guard<std::mutex> lock(run_job->mtx);
@@ -853,6 +895,7 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
             out["total_files"] = t->total_files.load();
             out["deleted_files"] = t->deleted_files.load();
             out["directories"] = t->directories.load();
+            out["eta_seconds"] = t->eta_seconds.load();
             out["raw"] = t->raw;
             out["disk_number"] = t->disk_number;
             out["fs"] = fs_type_name(t->fs_type);
@@ -1027,6 +1070,7 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
             out["failed_files"] = job->failed_files.load();
             out["total_bytes"] = job->total_bytes.load();
             out["recovered_bytes"] = job->recovered_bytes.load();
+            out["eta_seconds"] = job->eta_seconds.load();
             {
                 std::lock_guard<std::mutex> lock(job->mtx);
                 out["status"] = job->status;

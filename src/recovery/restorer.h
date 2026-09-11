@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "../include/types.h"
+#include "../include/eta.h"
 
 namespace recovery {
 
@@ -27,6 +28,11 @@ struct RecoverJob {
     std::atomic<uint64_t> failed_files{0};
     std::atomic<uint64_t> total_bytes{0};
     std::atomic<uint64_t> recovered_bytes{0};
+
+    // Estimated seconds remaining (updated by the worker's progress emits, read
+    // by the HTTP layer). -1 = no estimate yet.
+    std::atomic<int64_t> eta_seconds{-1};
+    EtaEstimator eta;  // worker-thread-only progress-rate state
 
     // Control flags (checked by the worker between files and between clusters
     // of a large file, so pause/stop take effect promptly without corrupting

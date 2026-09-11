@@ -253,6 +253,23 @@ void Restorer::recover_worker(std::shared_ptr<RecoverJob> job,
         j["failed_files"] = job->failed_files.load();
         j["total_bytes"] = job->total_bytes.load();
         j["recovered_bytes"] = job->recovered_bytes.load();
+        // ETA is driven by byte progress (recovered / total), which advances
+        // continuously during a large file — unlike the coarse `progress` %
+        // that only moves at file boundaries.
+        {
+            uint64_t rb = job->recovered_bytes.load();
+            uint64_t tb = job->total_bytes.load();
+            int pct = 0;
+            if (tb > 0) pct = static_cast<int>((rb * 100) / tb);
+            else {
+                uint64_t done = job->recovered_files.load() + job->failed_files.load();
+                uint64_t tf = job->total_files.load();
+                if (tf > 0) pct = static_cast<int>((done * 100) / tf);
+            }
+            job->eta.update(pct);
+            job->eta_seconds.store(job->eta.eta_seconds());
+        }
+        j["eta_seconds"] = job->eta_seconds.load();
         {
             std::lock_guard<std::mutex> lock(job->mtx);
             j["status"] = job->status;

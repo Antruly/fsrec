@@ -195,6 +195,8 @@
   .progress > div { height: 100%; background: linear-gradient(90deg, var(--amber), #f59e0b); width: 0; transition: width .3s; border-radius: 20px; }
   .progress.green > div { background: linear-gradient(90deg, var(--green), #4ade80); }
   .prog-label { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--muted); margin-top: 6px; }
+  .prog-label .right { display: flex; gap: 12px; align-items: baseline; }
+  .eta { color: var(--amber); font-weight: 600; white-space: nowrap; }
 
   /* ---- stats grid ---- */
   .stat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px; }
@@ -343,7 +345,7 @@
     <div class="topbar-inner">
       <div class="logo">🛠️</div>
       <div class="brand">
-        <h1>fsrec <span class="ver">v1.0.13</span></h1>
+        <h1>fsrec <span class="ver">v1.0.14</span></h1>
         <p class="sub">数据恢复 · 误格式化 / 覆盖的硬盘 · 只读扫描定位 → 手动确认恢复</p>
       </div>
       <div class="topbar-right">
@@ -417,7 +419,7 @@
       </div>
       <div class="progress-block" id="progressWrap" style="display:none">
         <div class="progress"><div id="bar"></div></div>
-        <div class="prog-label"><span id="stats"></span><span id="pct"></span></div>
+        <div class="prog-label"><span id="stats"></span><span class="right"><span id="eta" class="eta"></span><span id="pct"></span></span></div>
       </div>
     </div>
 
@@ -477,7 +479,7 @@
       </div>
       <div class="progress-block" id="recoverWrap" style="display:none">
         <div class="progress green"><div id="rbar"></div></div>
-        <div class="prog-label"><span id="rstats"></span><span id="rpct"></span></div>
+        <div class="prog-label"><span id="rstats"></span><span class="right"><span id="reta" class="eta"></span><span id="rpct"></span></span></div>
         <div class="curfile" id="curFile">正在准备…</div>
         <div class="thin"><div id="rfilebar"></div></div>
       </div>
@@ -487,7 +489,7 @@
 
   <footer class="footer">
     <div class="footer-inner">
-      <span>fsrec <span class="ver">v1.0.13</span> · 数据恢复工具</span>
+      <span>fsrec <span class="ver">v1.0.14</span> · 数据恢复工具</span>
       <span class="footer-sep">·</span>
       <span>扫描阶段只读，绝不写入源盘；恢复需手动确认</span>
       <span class="footer-sep">·</span>
@@ -543,7 +545,7 @@
       <div class="modal-head">关于 fsrec <button class="modal-x" id="closeAbout">✕</button></div>
       <div class="about-body">
         <div class="about-logo">🛠️</div>
-        <h2 class="about-title">fsrec <span class="ver">v1.0.13</span></h2>
+        <h2 class="about-title">fsrec <span class="ver">v1.0.14</span></h2>
         <p class="about-tagline">数据恢复工具</p>
         <p class="about-desc">通过 Windows 原始磁盘读取接口解析 NTFS / FAT / exFAT 文件系统、重建目录树，帮助你在硬盘被误格式化、分区被覆盖或文件被删除后，浏览并恢复文件与目录结构。</p>
         <div class="about-stack">
@@ -613,6 +615,23 @@ function fmtTime(iso) {
   const d = new Date(iso); if (isNaN(d)) return iso;
   const p = (x) => String(x).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+// Estimated remaining time as a compact human string. Units shown are the
+// non-zero ones (days/hours/minutes); <24h hides days, <1h hides hours, and the
+// sub-minute range shows no seconds ("不足 1 分钟"). Returns '' when unknown.
+function fmtEta(sec) {
+  if (sec == null || sec < 0 || !isFinite(sec)) return '';
+  sec = Math.round(sec);
+  if (sec < 60) return '不足 1 分钟';
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor(sec / 3600) % 24;
+  const m = Math.floor(sec / 60) % 60;
+  const parts = [];
+  if (d) parts.push(d + '天');
+  if (h) parts.push(h + '小时');
+  if (m) parts.push(m + '分');
+  if (!parts.length) parts.push('1分');
+  return parts.join('');
 }
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1065,7 +1084,8 @@ function applyScanState(s) {
   const st = s.status;
   $('bar').style.width = (s.progress || 0) + '%';
   $('pct').textContent = (s.progress || 0) + '%';
-  if (st === 'completed' || st === 'failed' || st === 'stopped') { finishScan(s); return; }
+  if (st === 'completed' || st === 'failed' || st === 'stopped') { $('eta').textContent = ''; finishScan(s); return; }
+  $('eta').textContent = fmtEta(s.eta_seconds) ? '⏱ 预计剩余 ' + fmtEta(s.eta_seconds) : '';
   if (st === 'paused') {
     $('stats').innerHTML = `<span style="color:var(--amber)">⏸ 扫描已暂停</span> · 已定位 <b>${s.total_files}</b> 个文件 · <b>${s.directories}</b> 个目录`;
     setScanControls('paused');
@@ -1083,6 +1103,7 @@ async function finishScan(s) {
   currentScanTaskId = null;
   scanDiskNumber = null;
   setScanControls('done');
+  $('eta').textContent = '';
   if (s.status === 'completed') {
     $('bar').style.width = '100%';
     $('pct').textContent = '100%';
@@ -1518,8 +1539,10 @@ function applyRecoverState(s) {
   const st = s.status;
   $('rbar').style.width = (s.progress || 0) + '%';
   $('rpct').textContent = (s.progress || 0) + '%';
+  $('reta').textContent = '';
 
   if (st === 'running' || st === 'paused') {
+    $('reta').textContent = fmtEta(s.eta_seconds) ? '⏱ 预计剩余 ' + fmtEta(s.eta_seconds) : '';
     $('rstats').innerHTML =
       (st === 'paused' ? `<span style="color:var(--amber)">⏸ 恢复已暂停</span> · ` : '') +
       `成功 <b>${s.recovered_files}</b> · 失败 <b>${s.failed_files}</b> · 共 <b>${s.total_files}</b>` +

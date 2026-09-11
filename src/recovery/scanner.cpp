@@ -1160,6 +1160,19 @@ void Scanner::emit_scan_progress(const std::shared_ptr<ScanTask>& task,
     j["total_files"] = task->total_files.load();
     j["deleted_files"] = task->deleted_files.load();
     j["directories"] = task->directories.load();
+    // Estimated time remaining, from the smoothed progress rate. Prefer a
+    // continuous byte-based percentage when the worker supplies one (the
+    // whole-disk $MFT search); otherwise fall back to the coarse phase %.
+    {
+        uint64_t sb = task->scanned_bytes.load();
+        uint64_t tb = task->total_bytes.load();
+        if (tb > 0 && sb <= tb)
+            task->eta.update(static_cast<int>((sb * 100) / tb));
+        else
+            task->eta.update(task->progress.load());
+        task->eta_seconds.store(task->eta.eta_seconds());
+    }
+    j["eta_seconds"] = task->eta_seconds.load();
     {
         std::lock_guard<std::mutex> lock(task->mtx);
         j["status"] = task->status;
@@ -1588,6 +1601,11 @@ void Scanner::raw_scan_all_worker(std::shared_ptr<ScanTask> meta) {
         std::lock_guard<std::mutex> lock(meta->mtx);
         meta->current_path = "正在定位分区 ($MFT / FAT / exFAT)…";
     }
+    // Phase 1 (whole-disk $MFT search) is the long pole; drive ETA off bytes
+    // read so it advances continuously instead of one point per ~1/8 of the disk.
+    meta->total_bytes.store(full);
+    meta->scanned_bytes.store(0);
+    meta->eta.reset();
     meta->progress = 1;
     emit(true);
 
@@ -1606,10 +1624,11 @@ void Scanner::raw_scan_all_worker(std::shared_ptr<ScanTask> meta) {
                 if (meta->stop_requested.load()) return;
                 int pct = (full == 0) ? 5 : 1 + static_cast<int>((8 * done) / full);
                 if (pct > 9) pct = 9;
-                if (pct > meta->progress.load()) {
-                    meta->progress = pct;
-                    emit(false);
-                }
+                if (pct > meta->progress.load()) meta->progress = pct;
+                // Feed the byte position continuously (emit throttles to 50 ms)
+                // so the ETA estimator sees real movement every update.
+                meta->scanned_bytes.store(done);
+                emit(false);
             });
         if (meta->stop_requested.load()) { finish("stopped", ""); return; }
     }
@@ -1667,6 +1686,11 @@ void Scanner::raw_scan_all_worker(std::shared_ptr<ScanTask> meta) {
     }
 
     meta->progress = 10;
+    // Phase 1's whole-disk byte basis no longer applies; revert to the
+    // per-volume progress % and re-arm the estimator for the shorter phase 4.
+    meta->total_bytes.store(0);
+    meta->scanned_bytes.store(0);
+    meta->eta.reset();
     emit(true);
 
     // 3. Spawn one scan task per volume (NTFS + FAT/exFAT interleaved by
