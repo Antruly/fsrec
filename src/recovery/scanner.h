@@ -184,6 +184,13 @@ public:
     // destructor's join returns quickly (graceful shutdown).
     void shutdown();
 
+    // Join every worker thread (waiting for in-flight scans to wind down and
+    // finish their "stopped" transition). Idempotent — safe to call after a
+    // previous shutdown(), and safe for the destructor to call again (the
+    // vector is drained). Used by main() so it can wait for workers before
+    // force-exiting past the fragile libuvcpp/HttpApi destructors.
+    void join_workers();
+
     // Scan-session model (one record per scanned physical disk, deduped by
     // serial, persisted to data/scans.json).
     std::vector<ScanSession> list_sessions();

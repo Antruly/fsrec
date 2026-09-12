@@ -40,8 +40,10 @@ static std::function<void()> g_stop_stats;  // stops the background stats poller
 void start_shutdown_watchdog() {
     std::thread([]() {
         std::this_thread::sleep_for(std::chrono::seconds(5));
-        std::fprintf(stderr, "[fsrec] 优雅关闭超时，强制退出。\n");
-        std::fflush(stderr);
+        // Force-exit immediately. Deliberately NO stdio call before ExitProcess:
+        // during teardown the CRT stream locks can be held by a thread stuck in
+        // a destructor, so fprintf/fflush here could deadlock and never reach
+        // ExitProcess — leaving the console window open forever.
         ExitProcess(0);
     }).detach();
 }
@@ -57,8 +59,8 @@ BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
     case CTRL_SHUTDOWN_EVENT:
     case CTRL_LOGOFF_EVENT:
         if (!g_shutting_down.exchange(true)) {
+            start_shutdown_watchdog(); // arm the force-exit backstop FIRST
             FSLOG_WARN("正在安全关闭服务，请稍候…");
-            start_shutdown_watchdog();
             if (g_stop_stats) g_stop_stats();
             if (g_scanner)  g_scanner->shutdown();
             if (g_restorer) g_restorer->shutdown();
@@ -219,8 +221,8 @@ int main(int argc, char** argv) {
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
     api.set_shutdown_callback([&]() {
         if (!g_shutting_down.exchange(true)) {
+            start_shutdown_watchdog(); // arm the force-exit backstop FIRST
             FSLOG_WARN("正在安全关闭服务…");
-            start_shutdown_watchdog();
             api.stop_stats();
             scanner.shutdown();
             restorer.shutdown();
@@ -266,6 +268,23 @@ int main(int argc, char** argv) {
 
     server.run();
 
+    // Graceful teardown. The shutdown callback / Ctrl handler has already asked
+    // the workers to stop and stopped the event loop, so run() has returned.
+    // Join the workers now so an in-progress scan/recovery can wind down, then
+    // exit the process directly — bypassing the C++ destructors, two of which
+    // can hang the console window for many seconds:
+    //   • ~HttpApi() joins the stats poller, which may be blocked inside a
+    //     synchronous disk call (CreateFileA / DeviceIoControl on a stalled USB
+    //     bridge or card reader);
+    //   • ~uvcpp_tcp_server() pumps a loop that still holds the stats timer,
+    //     the WebSocket async handle and any live clients.
+    // The watchdog above remains the final backstop if a worker thread itself
+    // is stuck on a stalled source/target disk.
+    scanner.shutdown();
+    restorer.shutdown();
+    scanner.join_workers();
+    restorer.join_workers();
+
     fslog::Logger::instance().shutdown();
-    return 0;
+    ExitProcess(0);
 }

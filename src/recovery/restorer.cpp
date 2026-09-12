@@ -161,9 +161,7 @@ private:
 } // namespace
 
 Restorer::~Restorer() {
-    for (auto& t : threads_) {
-        if (t.joinable()) t.join();
-    }
+    join_workers();
 }
 
 std::string Restorer::start_recover(std::shared_ptr<ScanTask> task,

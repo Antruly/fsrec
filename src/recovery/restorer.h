@@ -91,6 +91,18 @@ public:
         }
     }
 
+    // Join every worker thread (waiting for in-flight recoveries to wind down).
+    // Idempotent and safe for the destructor to call again. Used by main() so
+    // it can wait for workers before force-exiting past the fragile
+    // libuvcpp/HttpApi destructors.
+    void join_workers() {
+        std::vector<std::thread> to_join;
+        to_join.swap(threads_);
+        for (auto& t : to_join) {
+            if (t.joinable()) t.join();
+        }
+    }
+
 private:
     void recover_worker(std::shared_ptr<RecoverJob> job,
                         std::shared_ptr<ScanTask> task,

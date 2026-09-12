@@ -739,7 +739,7 @@ std::vector<FatVolume> detect_mbr_fat_volumes(DiskReader& reader, bool* need_mft
 
 } // namespace
 
-Scanner::~Scanner() {
+void Scanner::join_workers() {
     std::vector<std::thread> to_join;
     {
         std::lock_guard<std::mutex> lock(threads_mutex_);
@@ -748,6 +748,10 @@ Scanner::~Scanner() {
     for (auto& t : to_join) {
         if (t.joinable()) t.join();
     }
+}
+
+Scanner::~Scanner() {
+    join_workers();
 }
 
 std::string Scanner::start_scan(const std::string& drive, const std::string& mode) {

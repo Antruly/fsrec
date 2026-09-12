@@ -7,7 +7,7 @@
 通过 Windows 原始磁盘读取接口解析 NTFS / FAT / exFAT 文件系统、重建目录树，支持扫描、搜索与**选择性恢复**已删除或误格式化后仍存留的文件。
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.0.16-brightgreen.svg)](https://github.com/Antruly/fsrec/releases)
+[![Version](https://img.shields.io/badge/version-1.0.17-brightgreen.svg)](https://github.com/Antruly/fsrec/releases)
 [![Language](https://img.shields.io/badge/language-C%2B%2B17-00599C.svg)](#)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-lightgrey.svg)](#)
 
@@ -55,7 +55,7 @@
 
 ### 直接下载（推荐）
 
-从 [Releases](https://github.com/Antruly/fsrec/releases) 下载 `fsrec_Setup_1.0.16.exe`，
+从 [Releases](https://github.com/Antruly/fsrec/releases) 下载 `fsrec_Setup_1.0.17.exe`，
 双击安装（全中文向导）。安装完成后双击桌面 / 开始菜单的 **fsrec** 图标：
 
 1. 自动触发 UAC 提权（`requireAdministrator` 清单）
@@ -96,7 +96,7 @@ recovery_server.exe --no-browser   # 不自动打开浏览器
 
 ```powershell
 curl http://localhost:8080/ping
-# → {"status":"ok","name":"fsrec","version":"1.0.16"}
+# → {"status":"ok","name":"fsrec","version":"1.0.17"}
 ```
 
 ---
@@ -165,7 +165,7 @@ fsrec/
 powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
 ```
 
-产物输出到 `release\fsrec_Setup_1.0.16.exe`（全中文安装向导，安装后生成开始菜单 / 桌面快捷方式，
+产物输出到 `release\fsrec_Setup_1.0.17.exe`（全中文安装向导，安装后生成开始菜单 / 桌面快捷方式，
 双击 exe 自动提权并打开浏览器）。
 
 ---

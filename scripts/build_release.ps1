@@ -1,5 +1,5 @@
 # One-shot release builder: compiles the C++ backend, then packs everything
-# into a Chinese Inno Setup installer at release\fsrec_Setup_1.0.16.exe.
+# into a Chinese Inno Setup installer at release\fsrec_Setup_1.0.17.exe.
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1          # build + package
@@ -60,7 +60,7 @@ Write-Host "[4/4] Compiling installer (ISCC)..."
 & $iscc $iss
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
 
-$out = Join-Path $root 'release\fsrec_Setup_1.0.16.exe'
+$out = Join-Path $root 'release\fsrec_Setup_1.0.17.exe'
 if (-not (Test-Path $out)) { throw "installer output not found: $out" }
 Write-Host ""
 Write-Host ("DONE -> " + $out)
