@@ -2,7 +2,7 @@
 ; 编译：ISCC.exe packaging\fsrec.iss   （或运行 scripts\build_release.ps1）
 
 #define MyAppName "fsrec"
-#define MyAppVersion "1.0.15"
+#define MyAppVersion "1.0.16"
 #define MyAppPublisher "fsrec"
 #define MyAppExeName "recovery_server.exe"
 

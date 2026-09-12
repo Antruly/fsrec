@@ -7,8 +7,8 @@
 IDI_APP ICON "fsrec.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION     1,0,15,0
- PRODUCTVERSION  1,0,15,0
+ FILEVERSION     1,0,16,0
+ PRODUCTVERSION  1,0,16,0
  FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
  FILEFLAGS       0x0L
  FILEOS          VOS_NT_WINDOWS32
@@ -21,11 +21,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "fsrec"
             VALUE "FileDescription",  "fsrec - NTFS 数据恢复工具"
-            VALUE "FileVersion",      "1.0.15"
+            VALUE "FileVersion",      "1.0.16"
             VALUE "InternalName",     "recovery_server"
             VALUE "OriginalFilename", "recovery_server.exe"
             VALUE "ProductName",      "fsrec"
-            VALUE "ProductVersion",   "1.0.15"
+            VALUE "ProductVersion",   "1.0.16"
             VALUE "LegalCopyright",   "Copyright (C) 2026"
         END
     END
