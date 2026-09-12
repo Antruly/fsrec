@@ -33,18 +33,27 @@ static std::atomic<bool> g_shutting_down{false};
 static std::function<void()> g_wake_loop;   // pokes the libuv loop (uv_async_send)
 static std::function<void()> g_stop_stats;  // stops the background stats poller
 
-// Last-resort shutdown watchdog: if the graceful shutdown below hasn't let the
-// process exit within a few seconds (e.g. a worker thread or the stats poller
-// is stuck inside a blocking syscall), force-exit so the console window never
-// hangs open. Detached — killed harmlessly when the normal exit wins.
-void start_shutdown_watchdog() {
+// Last-resort shutdown watchdog, armed ONCE at startup. Every shutdown path
+// (console Ctrl handler, HTTP "退出" button, …) sets g_shutting_down; if the
+// process is somehow still alive 5 seconds after that — e.g. a worker thread or
+// the stats poller stuck in a blocking syscall, or a log write blocked on a
+// console that is already closing — force-exit so the console window can never
+// hang open. Arming it here (rather than inside each shutdown path) means it
+// protects even a path that blocks before it could arm its own timer.
+// Detached: killed harmlessly when a normal exit wins.
+void arm_shutdown_watchdog() {
     std::thread([]() {
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-        // Force-exit immediately. Deliberately NO stdio call before ExitProcess:
-        // during teardown the CRT stream locks can be held by a thread stuck in
-        // a destructor, so fprintf/fflush here could deadlock and never reach
-        // ExitProcess — leaving the console window open forever.
-        ExitProcess(0);
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (g_shutting_down.load()) {
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                // Force-exit immediately. Deliberately NO stdio call before
+                // ExitProcess: during teardown the CRT stream locks can be held
+                // by a thread stuck in a destructor, so fprintf/fflush here could
+                // deadlock and never reach ExitProcess — leaving the console open.
+                ExitProcess(0);
+            }
+        }
     }).detach();
 }
 
@@ -59,7 +68,6 @@ BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
     case CTRL_SHUTDOWN_EVENT:
     case CTRL_LOGOFF_EVENT:
         if (!g_shutting_down.exchange(true)) {
-            start_shutdown_watchdog(); // arm the force-exit backstop FIRST
             FSLOG_WARN("正在安全关闭服务，请稍候…");
             if (g_stop_stats) g_stop_stats();
             if (g_scanner)  g_scanner->shutdown();
@@ -221,7 +229,6 @@ int main(int argc, char** argv) {
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
     api.set_shutdown_callback([&]() {
         if (!g_shutting_down.exchange(true)) {
-            start_shutdown_watchdog(); // arm the force-exit backstop FIRST
             FSLOG_WARN("正在安全关闭服务…");
             api.stop_stats();
             scanner.shutdown();
@@ -265,6 +272,10 @@ int main(int argc, char** argv) {
         // > 32 indicate success; <= 32 is an error we deliberately ignore.
         ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     }
+
+    // Arm the last-resort watchdog so that no matter which shutdown path fires
+    // (Ctrl handler, HTTP "退出" button), the process is guaranteed to exit.
+    arm_shutdown_watchdog();
 
     server.run();
 
