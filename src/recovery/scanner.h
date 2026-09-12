@@ -16,6 +16,11 @@
 
 namespace recovery {
 
+// File-distribution occupancy-map resolution (bits per partition; rendered as a
+// 1000×100 heatmap in the UI). Bit i covers the i-th 1/kExtentResolution slice
+// of the partition's byte span.
+constexpr int kExtentResolution = 100000;
+
 // A surviving $MFT region located on a physical disk.
 struct RawMftCandidate {
     uint64_t offset = 0;        // absolute byte offset of $MFT record 0
@@ -76,6 +81,10 @@ struct ScanTask {
     uint64_t volume_start = 0;      // detected volume start byte offset (raw mode)
     uint64_t volume_size = 0;       // detected volume byte size (0 = unknown)
     uint64_t mft_records_total = 0; // total $MFT records (from record 0 $DATA)
+
+    // File-distribution occupancy map (computed on completion; guarded by mtx).
+    std::string extent_map;    // hex-encoded bitmap, kExtentResolution bits ("" = none)
+    uint64_t extent_span = 0;  // byte span the bitmap covers (0 = none)
 
     // Filesystem family this volume was parsed as (NTFS / FAT12 / FAT16 /
     // FAT32 / exFAT). FAT volumes set this; NTFS volumes default to NTFS.

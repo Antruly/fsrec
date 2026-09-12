@@ -401,18 +401,22 @@
   .disk-layout .dl-label { font-size: 11.5px; color: var(--muted); margin-bottom: 7px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .disk-layout .dl-label > span:first-child { color: var(--text); font-weight: 700; }
   .disk-layout .dl-track {
-    position: relative; height: 30px; border-radius: 8px;
+    position: relative; height: 82px; border-radius: 8px;
     background: var(--bg); border: 1px solid var(--border); overflow: hidden;
   }
   .disk-layout .dl-track + .dl-track { margin-top: 4px; }
   .disk-layout .dl-part {
-    position: absolute; top: 3px; bottom: 3px; border-radius: 5px; cursor: pointer;
+    position: absolute; top: 3px; height: 24px; border-radius: 5px; cursor: pointer;
     display: flex; align-items: center; justify-content: center; overflow: hidden;
     border: 1px solid rgba(255,255,255,.22);
-    transition: filter .12s, box-shadow .12s, top .1s, bottom .1s, transform .1s;
+    transition: filter .12s, box-shadow .12s;
     min-width: 6px;
   }
-  .disk-layout .dl-part:hover { filter: brightness(1.14); box-shadow: 0 0 0 2px rgba(255,255,255,.4), 0 2px 10px rgba(0,0,0,.25); z-index: 5; top: 1px; bottom: 1px; }
+  .disk-layout .dl-part:hover { filter: brightness(1.14); box-shadow: 0 0 0 2px rgba(255,255,255,.4), 0 2px 10px rgba(0,0,0,.25); z-index: 5; }
+  .disk-layout .dl-occ {
+    position: absolute; top: 32px; height: 46px; border-radius: 4px;
+    pointer-events: none;
+  }
   .disk-layout .dl-part .dl-txt { font-size: 10.5px; font-weight: 700; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,.55); white-space: nowrap; overflow: hidden; padding: 0 5px; pointer-events: none; }
   .disk-layout .dl-part.small .dl-txt { display: none; }
   .disk-layout .dl-part.unknown { background: repeating-linear-gradient(45deg, #3b4252, #3b4252 4px, #2c313d 4px, #2c313d 8px); border-color: rgba(255,255,255,.12); }
@@ -1217,14 +1221,65 @@ async function loadSavedScans() {
 const PART_COLORS = ['#2f6bff', '#21c55d', '#f59e0b', '#e11d48', '#8b5cf6', '#06b6d4', '#f97316', '#14b8a6', '#ec4899', '#a3e635'];
 function partColor(i) { return PART_COLORS[i % PART_COLORS.length]; }
 
+function hexToRgb(hex) {
+  const h = hex.replace('#', '');
+  return { r: parseInt(h.substr(0, 2), 16), g: parseInt(h.substr(2, 2), 16), b: parseInt(h.substr(4, 2), 16) };
+}
+
+// Draw a partition's file-distribution heatmap onto `canvas`. `hex` is the
+// backend's kExtentResolution-bit occupancy bitmap (hex-encoded, 100000 bits):
+// bit i = the i-th 1/100000 slice of the partition's byte span holds file data.
+// Rendered as a 1000×100 raster (row-major: index 0 = top-left, reading order),
+// so every pixel = 1/100000 of the span. Occupied pixels are the partition
+// color (opaque); empty pixels keep a faint tint of it, so "有文件 = 深色 /
+// 没有文件 = 半透明" reads directly.
+function drawOccupancy(canvas, hex, color) {
+  const W = 1000, H = 100;
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  const c = hexToRgb(color);
+  const img = ctx.createImageData(W, H);
+  const d = img.data;
+  // Faint tint for "no file" (alpha ~36/255).
+  for (let i = 0; i < d.length; i += 4) {
+    d[i] = c.r; d[i + 1] = c.g; d[i + 2] = c.b; d[i + 3] = 36;
+  }
+  if (hex) {
+    const bytes = [];
+    for (let i = 0; i + 1 < hex.length; i += 2) bytes.push(parseInt(hex.substr(i, 2), 16));
+    let bit = 0;
+    for (let b = 0; b < bytes.length && bit < W * H; b++) {
+      const v = bytes[b];
+      for (let k = 0; k < 8 && bit < W * H; k++) {
+        if (v & (1 << k)) {
+          const col = bit % W, row = (bit / W) | 0;
+          const o = (row * W + col) * 4;
+          d[o] = c.r; d[o + 1] = c.g; d[o + 2] = c.b; d[o + 3] = 255;
+        }
+        bit++;
+      }
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
 // Greedy interval-lane assignment so overlapping partitions stack onto separate
 // lanes (vertical strips) without ever overlapping within a lane.
 function layoutLanes(parts, diskSize) {
+  // Starts of every partition, sorted, so an unknown-size partition can be
+  // spliced up to the next partition's start (nothing else was scanned, so
+  // treat this segment as running up to the next partition).
+  const starts = parts.map(p => Number(p.volume_start) || 0).sort((a, b) => a - b);
   const items = parts.map((p, idx) => {
     const start = Number(p.volume_start) || 0;
     let size = Number(p.volume_size) || 0;
     const unknownSize = size <= 0;
-    if (unknownSize) size = diskSize ? diskSize * 0.006 : 1; // thin marker for unknown size
+    if (unknownSize) {
+      const nextStart = starts.find(s => s > start);
+      if (nextStart !== undefined) size = nextStart - start;
+      else if (diskSize && diskSize > start) size = diskSize - start; // last partition → disk end
+      else size = diskSize ? diskSize * 0.006 : 1; // fallback thin marker
+    }
     return { p, idx, start, end: start + size, size, unknownSize, lane: 0 };
   }).sort((a, b) => a.start - b.start || a.end - b.end);
   const laneEnds = [];
@@ -1251,7 +1306,7 @@ function buildDiskLayoutBar(s, parts) {
 
   const label = document.createElement('div');
   label.className = 'dl-label';
-  label.innerHTML = `<span>💽 分区布局</span><span class="muted">整盘 ${fmtBytes(effSize)} · 从左到右 = 磁盘起始 → 末尾 · 上下叠加 = 分区区域重叠</span>`;
+  label.innerHTML = `<span>💽 分区布局</span><span class="muted">整盘 ${fmtBytes(effSize)} · 从左到右 = 磁盘起始 → 末尾 · 上下叠加 = 分区区域重叠 · 下方色带深色 = 有文件数据</span>`;
   bar.appendChild(label);
 
   const tip = document.createElement('div');
@@ -1289,6 +1344,19 @@ function buildDiskLayoutBar(s, parts) {
         if (row) { row.scrollIntoView({ behavior: 'smooth', block: 'center' }); row.classList.add('flash'); setTimeout(() => row.classList.remove('flash'), 1700); }
       });
       track.appendChild(seg);
+      // File-distribution heatmap below the partition bar. The bitmap's byte
+      // span is `extent_span` (for unknown-size partitions this is narrower than
+      // the spliced bar above — it reflects where files were actually found).
+      if (p.extent_map && effSize) {
+        const span = Number(p.extent_span) || 0;
+        const occW = span > 0 ? Math.max(span / effSize * 100, 0.7) : width;
+        const occ = document.createElement('canvas');
+        occ.className = 'dl-occ';
+        occ.style.left = left + '%';
+        occ.style.width = occW + '%';
+        drawOccupancy(occ, p.extent_map, partColor(it.idx));
+        track.appendChild(occ);
+      }
     }
     bar.appendChild(track);
   }

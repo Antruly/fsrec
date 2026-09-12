@@ -855,6 +855,9 @@ void HttpApi::handle_request(uvcpp::uvcpp_http_request& req,
                         p["cluster_size"] = t->cluster_size;
                         p["volume_start"] = t->volume_start;
                         p["volume_size"] = t->volume_size;
+                        p["extent_map"] = t->extent_map;
+                        p["extent_span"] = t->extent_span;
+                        p["extent_res"] = kExtentResolution;
                     }
                     parts.push_back(std::move(p));
                 }

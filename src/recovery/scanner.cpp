@@ -132,6 +132,68 @@ FileNodePtr deserialize_node(const json& j) {
     return node;
 }
 
+// ---------------------------------------------------------------------------
+// File-distribution occupancy map
+// ---------------------------------------------------------------------------
+
+struct ExtentMap {
+    std::string hex;      // hex-encoded bitmap, kExtentResolution bits
+    uint64_t    span = 0; // byte length the bitmap covers (0 = nothing)
+};
+
+// Walk the result tree and mark every byte range that holds non-resident file
+// data into a fixed-resolution bitmap, so the UI can draw a fine-grained
+// "where files live" map for each partition. Returns an empty map when there is
+// nothing to show. The bitmap spans [volume_start, volume_start + span); when
+// volume_size is unknown the span is grown to the last file's end.
+ExtentMap compute_extent_map(const FileNodePtr& root, uint64_t volume_start,
+                             uint64_t volume_size, uint64_t cluster_size) {
+    ExtentMap out;
+    if (!root || cluster_size == 0) return out;
+
+    std::vector<std::pair<uint64_t, uint64_t>> spans;
+    std::function<void(const FileNodePtr&)> walk = [&](const FileNodePtr& n) {
+        if (n->has_data && !n->resident) {
+            for (const auto& r : n->data_runs) {
+                if (r.sparse || r.length == 0 || r.lcn < 0) continue;
+                uint64_t phys = volume_start + static_cast<uint64_t>(r.lcn) * cluster_size;
+                uint64_t len = r.length * cluster_size;
+                spans.push_back({phys, phys + len});
+            }
+        }
+        for (const auto& c : n->children) walk(c);
+    };
+    walk(root);
+    if (spans.empty()) return out;
+
+    uint64_t end = volume_start + volume_size;
+    if (volume_size == 0) {
+        end = volume_start;
+        for (const auto& s : spans) if (s.second > end) end = s.second;
+    }
+    if (end <= volume_start) return out;
+    uint64_t total = end - volume_start;
+
+    std::vector<uint8_t> bits((kExtentResolution + 7) / 8, 0);
+    auto mark = [&](uint64_t a, uint64_t b) {
+        if (a < volume_start) a = volume_start;
+        if (b > end) b = end;
+        if (a >= b) return;
+        uint64_t i0 = (a - volume_start) * kExtentResolution / total;
+        uint64_t i1 = (b - volume_start) * kExtentResolution / total;
+        if (i1 <= i0) i1 = i0 + 1;
+        if (i0 >= static_cast<uint64_t>(kExtentResolution)) i0 = kExtentResolution - 1;
+        if (i1 > static_cast<uint64_t>(kExtentResolution)) i1 = kExtentResolution;
+        for (uint64_t i = i0; i < i1; ++i)
+            bits[i >> 3] |= static_cast<uint8_t>(1u << (i & 7));
+    };
+    for (const auto& s : spans) mark(s.first, s.second);
+
+    out.hex = hex_encode(bits);
+    out.span = total;
+    return out;
+}
+
 // Write a completed raw scan to data_dir/scan_<disk-token>.json so it survives
 // a restart. Returns false (without throwing) on any I/O error.
 bool save_scan_file(const std::shared_ptr<ScanTask>& task, const std::string& data_dir) {
@@ -858,6 +920,13 @@ void Scanner::load_saved(const std::string& data_dir) {
             task->root = deserialize_node(j["root"]);
 
             {
+                ExtentMap em = compute_extent_map(task->root, task->volume_start,
+                                                  task->volume_size, task->cluster_size);
+                task->extent_map = em.hex;
+                task->extent_span = em.span;
+            }
+
+            {
                 std::lock_guard<std::mutex> lock(mutex_);
                 tasks_[task->id] = task;
             }
@@ -1469,6 +1538,13 @@ void Scanner::raw_scan_worker(std::shared_ptr<ScanTask> task) {
         return;
     }
 
+    {
+        ExtentMap em = compute_extent_map(root, volume_start, volume_size, cluster_size);
+        std::lock_guard<std::mutex> lock(task->mtx);
+        task->extent_map = em.hex;
+        task->extent_span = em.span;
+    }
+
     finish("completed", "");
 
     // Persist the completed scan locally so it can be re-opened after a restart
@@ -1519,6 +1595,7 @@ void Scanner::fat_scan_worker(std::shared_ptr<ScanTask> task) {
     FatScanResult res;
     bool ok = false;
     uint64_t vol_size = 0;  // volume byte size (total sectors × bytes per sector)
+    uint64_t cs = 0;        // cluster size in bytes (for the occupancy map)
     if (fs == FsType::exFAT) {
         ExfatBootInfo ei;
         if (!parse_exfat_boot(boot.data(), ei, &err)) {
@@ -1526,6 +1603,7 @@ void Scanner::fat_scan_worker(std::shared_ptr<ScanTask> task) {
             return;
         }
         vol_size = ei.volume_length * ei.bytes_per_sector();
+        cs = ei.cluster_size();
         ok = scan_exfat_volume(reader, ei, res, task->stop_requested, &err);
     } else if (fs == FsType::FAT12 || fs == FsType::FAT16 || fs == FsType::FAT32) {
         FatBootInfo fi;
@@ -1534,6 +1612,7 @@ void Scanner::fat_scan_worker(std::shared_ptr<ScanTask> task) {
             return;
         }
         vol_size = fi.total_sectors() * fi.bytes_per_sector;
+        cs = fi.cluster_size();
         ok = scan_fat_volume(reader, fi, res, task->stop_requested, &err);
     } else {
         finish("failed", "unsupported filesystem type");
@@ -1546,11 +1625,16 @@ void Scanner::fat_scan_worker(std::shared_ptr<ScanTask> task) {
         return;
     }
 
+    ExtentMap em = compute_extent_map(res.root, task->volume_start, vol_size, cs);
+
     {
         std::lock_guard<std::mutex> lock(task->mtx);
         task->root = res.root;
         task->nodes = std::move(res.nodes);
         task->volume_size = vol_size;
+        task->cluster_size = cs;
+        task->extent_map = em.hex;
+        task->extent_span = em.span;
         task->total_files.store(res.total_files);
         task->deleted_files.store(res.deleted_files);
         task->directories.store(res.directories);
